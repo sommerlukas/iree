@@ -91,6 +91,7 @@ def PackedStorageAttr :
           "isCompatibleWith",
           "dropWithoutMaterialization",
       ]>,
+      DeclareAttrInterfaceMethods<IREEEncoding_CollapsibleEncodingAttrInterface>,
       DeclareAttrInterfaceMethods<VerifiableTensorEncoding>
     ]> {
   let mnemonic = "packed_storage";
