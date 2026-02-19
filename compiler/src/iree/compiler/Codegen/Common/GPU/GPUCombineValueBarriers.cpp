@@ -177,9 +177,45 @@ combineValueBarrierPair(RewriterBase &rewriter,
   forwardSliceA.insert(forwardSliceB.begin(), forwardSliceB.end());
   // If the second barrier is contained in the combined forward slice of both
   // barriers, the barriers form a chain and cannot be combined.
-  if (forwardSliceA.contains(barrierA)) {
+  if (forwardSliceA.contains(barrierB)) {
     return failure();
   }
+
+  // The forward slice only tracks direct SSA uses within the same block. Ops
+  // between the barriers that capture values from the forward slice (or from
+  // the barriers themselves) via nested regions are missed. These ops also
+  // need to be moved, otherwise replaceOp will rewrite the captured uses to
+  // reference the combined barrier, breaking dominance. Bail out if any such
+  // op exists rather than trying to extend the slice, as this indicates a
+  // dependency chain between the barriers.
+  SetVector<Value> forwardSliceValues;
+  for (Operation *op : forwardSliceA) {
+    forwardSliceValues.insert(op->result_begin(), op->result_end());
+  }
+  for (Value result : barrierA->getResults()) {
+    forwardSliceValues.insert(result);
+  }
+  for (Value result : barrierB->getResults()) {
+    forwardSliceValues.insert(result);
+  }
+  for (Operation &op : *block) {
+    if (&op == barrierA || &op == barrierB || forwardSliceA.contains(&op)) {
+      continue;
+    }
+    if (op.getNumRegions() == 0) {
+      continue;
+    }
+    SetVector<Value> capturedValues;
+    for (Region &region : op.getRegions()) {
+      getUsedValuesDefinedAbove(region, region, capturedValues);
+    }
+    for (Value captured : capturedValues) {
+      if (forwardSliceValues.contains(captured)) {
+        return failure();
+      }
+    }
+  }
+
   // Move the forward slice after barrierB.
   moveForwardSliceAfterBarrier(rewriter, forwardSliceA, barrierB);
 
