@@ -144,28 +144,31 @@ void LayoutInfo::propagateLayoutForward(Value val) {
         continue;
       }
       if (contract.getLhs() == val || contract.getRhs() == val) {
-        if (contract->hasAttr("iree.gpu.mma")) {
-          // Intrinsic ops have fixed layouts, do not try to infer them through
-          // maps.
-          // TODO: Move to iree_gpu.multi_mma ops.
-          continue;
-        }
-        if (auto maskOp = dyn_cast<vector::MaskOp>(contract->getParentOp())) {
-          // We shouldn't have to do this... but vector.mask is badly designed
-          // and there is no mapping from the mask operand to the operation.
-          // TODO: Open vector.mask before vector distribute.
-          AffineMap map = contract.getMatchingIndexingMap(&use);
-          if (map.isPermutation()) {
-            setLayoutOrClone(&maskOp.getMaskMutable(),
-                             layout.apply(inversePermutation(map)));
-          }
-        }
-        // If lhs, rhs layout is known, infer result layout.
+
+        // If lhs, rhs layout is known, infer result and mask layout.
         VectorLayoutInterface lhsLayout = getLayout(contract.getLhs());
         VectorLayoutInterface rhsLayout = getLayout(contract.getRhs());
         if (lhsLayout && rhsLayout) {
           AffineMap lhsMap = contract.getIndexingMapsArray()[0];
           AffineMap rhsMap = contract.getIndexingMapsArray()[1];
+
+          // Set layout on the mask
+          if (auto maskOp = dyn_cast<vector::MaskOp>(contract->getParentOp())) {
+            AffineMap identityMap = AffineMap::getMultiDimIdentityMap(
+                lhsMap.getNumDims(), contract.getContext());
+            VectorLayoutInterface maskLayout = lhsLayout.getRecombinedLayout(
+                {lhsLayout, rhsLayout}, {lhsMap, rhsMap}, identityMap);
+            if (maskLayout) {
+              setLayoutOrClone(&maskOp.getMaskMutable(), maskLayout);
+            }
+          }
+
+          if (contract->hasAttr("iree.gpu.mma")) {
+            // Intrinsic ops have fixed layouts, do not try to infer the result
+            // layout through maps.
+            // TODO: Move to iree_gpu.multi_mma ops.
+            continue;
+          }
           AffineMap resMap = contract.getIndexingMapsArray()[2];
           VectorLayoutInterface resLayout = lhsLayout.getRecombinedLayout(
               {lhsLayout, rhsLayout}, {lhsMap, rhsMap}, resMap);
