@@ -84,8 +84,16 @@ struct UpcastContractOutput final : OpRewritePattern<vector::ContractionOp> {
 };
 
 static void inferMmaKind(vector::ContractionOp contract) {
+  // If the contract is inside a vector.mask, the forward slice from the
+  // contract's result stops at the mask's yield. Start from the mask's
+  // result instead to find the downstream ToLayoutOp.
+  Value sliceRoot = contract.getResult();
+  if (auto maskOp = dyn_cast<vector::MaskOp>(contract->getParentOp())) {
+    sliceRoot = maskOp.getResult(0);
+  }
+
   SetVector<Operation *> slice;
-  getForwardSlice(contract.getResult(), &slice);
+  getForwardSlice(sliceRoot, &slice);
 
   // Operations in slice are ordered in topological order, so the first
   // to_layout operation we encounter is setting the layout.
