@@ -1401,6 +1401,12 @@ struct DistributeMultiReduction final
 /// each thread performs operations on its locally distributed elements. Then,
 /// the resulting vector is interpreted in undistributed domain. The said
 /// undistributed vector is a partial reduction when contraction has been
+static SmallVector<Value>
+createDistributedMaskBounds(PatternRewriter &rewriter, Location loc,
+                            ValueRange upperBounds, NestedLayoutAttr layout,
+                            ArrayRef<Value> subgroupIndices,
+                            ArrayRef<Value> threadIndices);
+
 /// performed only thread locally. Therefore, a to-be-distributed
 /// vector.multi_reduce
 ////is added to complete the contraction.
@@ -1408,8 +1414,10 @@ struct DistributeContract final
     : MaskedOpDistributionPattern<vector::ContractionOp> {
   using MaskedOpDistributionPattern::MaskedOpDistributionPattern;
 
-  DistributeContract(MLIRContext *context, int64_t benefit = 1)
-      : MaskedOpDistributionPattern(context, benefit) {}
+  DistributeContract(MLIRContext *context, Value threadId, int64_t subgroupSize,
+                     int64_t benefit = 1)
+      : MaskedOpDistributionPattern(context, benefit), threadId(threadId),
+        subgroupSize(subgroupSize) {}
 
   LogicalResult
   matchAndRewrite(vector::ContractionOp contractOp,
@@ -1456,7 +1464,6 @@ struct DistributeContract final
     Value disLhs = getDistributed(rewriter, contractOp.getLhs(), lhsLayout);
     Value disRhs = getDistributed(rewriter, contractOp.getRhs(), rhsLayout);
 
-    VectorValue mask = nullptr;
     if (maskOp) {
       auto maskLayout = dyn_cast_if_present<NestedLayoutAttr>(
           maskSignature.value()[maskOp.getMask()]);
@@ -1464,23 +1471,74 @@ struct DistributeContract final
         return rewriter.notifyMatchFailure(maskOp,
                                            "expected nested layout attr");
       }
-      mask = getDistributed(rewriter, maskOp.getMask(), maskLayout);
       Value passThruLhs = getCombiningIdentityValue(
           loc, rewriter, contractOp.getKind(), disLhs.getType());
       Value passThruRhs = getCombiningIdentityValue(
           loc, rewriter, contractOp.getKind(), disRhs.getType());
 
-      VectorValue deInterleavedMask =
-          getDeinterleavedUnpackedForm(rewriter, mask, maskLayout);
-      VectorValue maskLhs = projectVector(rewriter, loc, deInterleavedMask,
-                                          contractOp.getIndexingMapsArray()[0]);
-      VectorValue interleavedMaskLhs =
-          getInterleavedPackedForm(rewriter, maskLhs, lhsLayout);
+      VectorValue interleavedMaskLhs, interleavedMaskRhs;
 
-      VectorValue maskRhs = projectVector(rewriter, loc, deInterleavedMask,
-                                          contractOp.getIndexingMapsArray()[1]);
-      VectorValue interleavedMaskRhs =
-          getInterleavedPackedForm(rewriter, maskRhs, rhsLayout);
+      auto createMaskOp =
+          maskOp.getMask().getDefiningOp<vector::CreateMaskOp>();
+      if (createMaskOp) {
+        // Compute per-operand distributed masks directly from create_mask
+        // bounds. This avoids creating a to_simt on the 3D mask, which would
+        // fail to fold when the mask layout has overlapping thread strides.
+        auto distributeMaskForOperand =
+            [&](AffineMap operandMap,
+                NestedLayoutAttr operandLayout) -> FailureOr<VectorValue> {
+          SmallVector<Value> subgroupIndices, threadIndices;
+          if (failed(populateWarpAndThreadIndices(
+                  rewriter, threadId, subgroupSize, operandLayout,
+                  subgroupIndices, threadIndices))) {
+            return failure();
+          }
+          SmallVector<Value> operandBounds;
+          for (int64_t i = 0; i < operandMap.getNumResults(); ++i) {
+            operandBounds.push_back(
+                createMaskOp.getOperand(operandMap.getDimPosition(i)));
+          }
+          SmallVector<Value> distributedBounds = createDistributedMaskBounds(
+              rewriter, loc, operandBounds, operandLayout, subgroupIndices,
+              threadIndices);
+          auto distrType =
+              VectorType::get(operandLayout.getDistributedUnpackedShape(),
+                              rewriter.getI1Type());
+          auto distrMask = vector::CreateMaskOp::create(
+              rewriter, loc, distrType, distributedBounds);
+          return getInterleavedPackedForm(rewriter, distrMask, operandLayout);
+        };
+
+        auto maybeLhs = distributeMaskForOperand(
+            contractOp.getIndexingMapsArray()[0], lhsLayout);
+        if (failed(maybeLhs)) {
+          return failure();
+        }
+        interleavedMaskLhs = *maybeLhs;
+
+        auto maybeRhs = distributeMaskForOperand(
+            contractOp.getIndexingMapsArray()[1], rhsLayout);
+        if (failed(maybeRhs)) {
+          return failure();
+        }
+        interleavedMaskRhs = *maybeRhs;
+      } else {
+        // Fallback: distribute via to_simt and structural decomposition.
+        VectorValue mask =
+            getDistributed(rewriter, maskOp.getMask(), maskLayout);
+        VectorValue deInterleavedMask =
+            getDeinterleavedUnpackedForm(rewriter, mask, maskLayout);
+        VectorValue maskLhs =
+            projectVector(rewriter, loc, deInterleavedMask,
+                          contractOp.getIndexingMapsArray()[0]);
+        interleavedMaskLhs =
+            getInterleavedPackedForm(rewriter, maskLhs, lhsLayout);
+        VectorValue maskRhs =
+            projectVector(rewriter, loc, deInterleavedMask,
+                          contractOp.getIndexingMapsArray()[1]);
+        interleavedMaskRhs =
+            getInterleavedPackedForm(rewriter, maskRhs, rhsLayout);
+      }
 
       disLhs = cast<VectorValue>(arith::SelectOp::create(rewriter, loc,
                                                          interleavedMaskLhs,
@@ -1644,6 +1702,9 @@ struct DistributeContract final
 
     return localContractOp;
   }
+
+  Value threadId;
+  int64_t subgroupSize;
 };
 
 struct DistributeTranspose final : OpDistributionPattern<vector::TransposeOp> {
@@ -1988,12 +2049,11 @@ struct DistributeStep final : OpDistributionPattern<vector::StepOp> {
   int64_t subgroupSize;
 };
 
-SmallVector<Value> createDistributedMaskBounds(PatternRewriter &rewriter,
-                                               Location loc,
-                                               ValueRange upperBounds,
-                                               NestedLayoutAttr layout,
-                                               ArrayRef<Value> subgroupIndices,
-                                               ArrayRef<Value> threadIndices) {
+static SmallVector<Value>
+createDistributedMaskBounds(PatternRewriter &rewriter, Location loc,
+                            ValueRange upperBounds, NestedLayoutAttr layout,
+                            ArrayRef<Value> subgroupIndices,
+                            ArrayRef<Value> threadIndices) {
   constexpr int64_t subgroupIdx = 0;
   constexpr int64_t batchIdx = 1;
   constexpr int64_t outerIdx = 2;
@@ -2250,7 +2310,8 @@ void populateGPUDistributeNestedLayoutAttrPatterns(
       patterns.getContext());
   patterns.add<DistributeMultiReduction>(patterns.getContext(), subgroupSize,
                                          maxBitsPerShuffle);
-  patterns.add<DistributeContract>(patterns.getContext());
+  patterns.add<DistributeContract>(patterns.getContext(), threadId,
+                                   subgroupSize);
   patterns.add<DistributeBatchOuterToLayoutConversions>(patterns.getContext());
   patterns.add<DistributeStep>(patterns.getContext(), threadId, subgroupSize);
   patterns.add<DistributeCreateMask, DistributeConstantMask>(
