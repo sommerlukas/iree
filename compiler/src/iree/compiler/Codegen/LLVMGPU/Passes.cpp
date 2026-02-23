@@ -849,6 +849,7 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
 
   // Preprocessing for vector distribution.
+  funcPassManager.addPass(createLLVMGPUResolveVectorMaskingPass());
   funcPassManager.addPass(createLLVMGPUCastTypeToFitMMAPass());
 
   // Vector SIMD -> Vector SIMT
