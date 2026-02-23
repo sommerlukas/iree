@@ -238,7 +238,9 @@ void LayoutInfo::propagateLayoutBackward(Value val) {
   }
 
   if (auto toLayout = dyn_cast<ToLayoutOp>(defOp)) {
-    setLayoutOrClone(&toLayout.getInputMutable(), layout);
+    if (!toLayout.getSharedMemoryConversion()) {
+      setLayoutOrClone(&toLayout.getInputMutable(), layout);
+    }
     return;
   }
 
