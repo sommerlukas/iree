@@ -59,6 +59,20 @@ def LLVMGPUCastTypeToFitMMAPass : InterfacePass<"iree-llvmgpu-cast-type-to-fit-m
                 "to target GPU MMA intrinsics";
 }
 
+def LLVMGPUResolveVectorMaskingPass :
+    InterfacePass<"iree-llvmgpu-resolve-vector-masking", "mlir::FunctionOpInterface"> {
+  let summary = "Unwrap masked vector.contract by padding operands with identity values";
+  let description = [{
+    This pass transforms `vector.mask { vector.contract }` patterns by unwrapping
+    the mask operation and instead padding the contract operands with identity
+    values, using arith.select to choose between the original and identity values.
+    This simplifies downstream passes by eliminating the masking operation.
+  }];
+  let dependentDialects = [
+    "arith::ArithDialect"
+  ];
+}
+
 def LLVMGPUConfigureTensorLayoutsPass :
     InterfacePass<"iree-llvmgpu-configure-tensor-layouts", "mlir::FunctionOpInterface"> {
   let summary = "Pass to set layouts on tensors for later vector distribution";
