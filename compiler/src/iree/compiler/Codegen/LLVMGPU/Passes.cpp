@@ -308,6 +308,7 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
       createOptimizeTensorInsertExtractSlicesPass(optimizeSlicesOptions));
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
+  funcPassManager.addPass(createLLVMGPUResolveVectorMaskingPass());
 }
 
 //===---------------------------------------------------------------------===//
@@ -849,7 +850,6 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
 
   // Preprocessing for vector distribution.
-  funcPassManager.addPass(createLLVMGPUResolveVectorMaskingPass());
   funcPassManager.addPass(createLLVMGPUCastTypeToFitMMAPass());
 
   // Vector SIMD -> Vector SIMT
