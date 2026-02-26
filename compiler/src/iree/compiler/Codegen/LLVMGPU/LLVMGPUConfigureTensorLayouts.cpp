@@ -83,7 +83,7 @@ FailureOr<SmallVector<int64_t>> divideTile(SmallVector<int64_t> &bounds,
   }
 
   for (auto [bound, div] : llvm::zip_equal(bounds, divisor)) {
-    bound /= div;
+    bound = llvm::divideCeil(bound, div);
   }
 
   return divisor;
