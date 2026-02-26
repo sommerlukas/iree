@@ -38,7 +38,9 @@ struct VectorizeToLayoutOpPattern final
     SmallVector<int64_t> readShape =
         toLayoutOp.getLayout().getUndistributedShape();
     Value mask = nullptr;
-    if (!toLayoutOp.getType().hasStaticShape()) {
+    bool needsMask =
+        !inputTy.hasStaticShape() || (readShape != inputTy.getShape());
+    if (needsMask) {
       SmallVector<OpFoldResult> mixedSourceDims =
           tensor::getMixedSizes(rewriter, loc, toLayoutOp.getInput());
       auto maskType = VectorType::get(readShape, rewriter.getI1Type());
