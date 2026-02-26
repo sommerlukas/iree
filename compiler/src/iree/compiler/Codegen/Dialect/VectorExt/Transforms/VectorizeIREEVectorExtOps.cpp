@@ -40,7 +40,9 @@ struct VectorizeToLayoutOpPattern final
     SmallVector<int64_t> readShape =
         toLayoutOp.getLayout().getUndistributedShape();
     Value mask = nullptr;
-    if (!toLayoutOp.getType().hasStaticShape()) {
+    bool needsMask =
+        !inputTy.hasStaticShape() || (readShape != inputTy.getShape());
+    if (needsMask) {
       Value input = toLayoutOp.getInput();
       SmallVector<OpFoldResult> mixedSourceDims;
       // Use reification if possible to reuse existing SSA values for the mask,
