@@ -421,7 +421,7 @@ LogicalResult NestedLayoutAttr::isValidLayout(ShapedType shapeTy,
     int64_t expectedShape = getSubgroupTile()[i] * getBatchTile()[i] *
                             getOuterTile()[i] * getThreadTile()[i] *
                             getElementTile()[i];
-    if (ShapedType::isStatic(shape[i]) && expectedShape != shape[i]) {
+    if (ShapedType::isStatic(shape[i]) && expectedShape < shape[i]) {
       std::string layoutStr;
       llvm::raw_string_ostream layoutOs(layoutStr);
       printStripped(layoutOs);
