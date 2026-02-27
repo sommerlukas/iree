@@ -5,11 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/Passes.h"
-#include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
-#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/Support/DebugLog.h"
@@ -31,51 +29,10 @@ namespace mlir::iree_compiler {
 #include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
-
-using IREE::VectorExt::VectorLayoutInterface;
-using LayoutMap = llvm::MapVector<Value, VectorLayoutInterface>;
-
-// Tries to determine iteration-space vector sizes for a linalg op from
-// propagated vector layouts. Maps operand-dimension sizes back to iteration
-// space dimensions via the op's indexing maps.
+// Returns the vector sizes from the local lowering config or try to infer them
+// from the tensor shapes and tiled loops in the IR.
 static std::optional<SizesAndScalableFlags>
-getVectorSizesFromLayout(linalg::LinalgOp linalgOp,
-                         const LayoutMap &layoutMap) {
-  unsigned numLoops = linalgOp.getNumLoops();
-  SmallVector<int64_t> iterationSpaceSizes(numLoops, -1);
-
-  for (OpOperand &operand : linalgOp->getOpOperands()) {
-    auto it = layoutMap.find(operand.get());
-    if (it == layoutMap.end()) {
-      continue;
-    }
-    VectorLayoutInterface layout = it->second;
-    SmallVector<int64_t> undistributedShape = layout.getUndistributedShape();
-    AffineMap indexingMap = linalgOp.getMatchingIndexingMap(&operand);
-    for (auto [operandDim, size] : llvm::enumerate(undistributedShape)) {
-      unsigned iterDim = indexingMap.getDimPosition(operandDim);
-      if (iterationSpaceSizes[iterDim] == -1) {
-        iterationSpaceSizes[iterDim] = size;
-      } else if (iterationSpaceSizes[iterDim] != size) {
-        return std::nullopt;
-      }
-    }
-  }
-
-  if (llvm::any_of(iterationSpaceSizes, [](int64_t s) { return s == -1; })) {
-    return std::nullopt;
-  }
-
-  SmallVector<bool> scalableFlags(numLoops, false);
-  return std::make_pair(iterationSpaceSizes, scalableFlags);
-}
-
-// Returns the vector sizes from the local lowering config, propagated vector
-// layouts, or tries to infer them from the tensor shapes and tiled loops in
-// the IR.
-static std::optional<SizesAndScalableFlags>
-getVectorSizes(Operation *op, bool useConfiguredVectorSizes,
-               const LayoutMap &layoutMap) {
+getVectorSizes(Operation *op, bool useConfiguredVectorSizes) {
   // Get vector sizes from the lowering config, if available in the op itself.
   IREE::Codegen::LoweringConfigAttrInterface loweringConfig =
       getLoweringConfig(op);
@@ -115,15 +72,6 @@ getVectorSizes(Operation *op, bool useConfiguredVectorSizes,
       return std::make_pair(*vectorSizes, scalableFlags);
     }
     LDBG() << "Failed to get configured vector sizes, fall back to inference";
-  }
-
-  // Try to get vector sizes from propagated vector layouts.
-  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-    auto fromLayout = getVectorSizesFromLayout(linalgOp, layoutMap);
-    if (fromLayout) {
-      LDBG() << "Use vector sizes from propagated layout";
-      return fromLayout;
-    }
   }
 
   // Try to infer the vector sizes from the IR.
@@ -228,12 +176,6 @@ void GenericVectorizationPass::runOnOperation() {
     }
   });
 
-  // Run layout analysis to propagate vector layouts from to_layout anchors.
-  LayoutMap layoutMap;
-  if (enableVectorMasking) {
-    (void)propagateVectorLayoutInfo(funcOp, layoutMap);
-  }
-
   // The vector input sizes inference needs to use producers, so we apply
   // vectorization from bottom to top.
   std::reverse(candidates.begin(), candidates.end());
@@ -242,7 +184,7 @@ void GenericVectorizationPass::runOnOperation() {
     SmallVector<bool> scalableVecDims;
     if (enableVectorMasking) {
       std::optional<SizesAndScalableFlags> vectorSizesAndScalableDims =
-          getVectorSizes(op, useConfiguredVectorSizes, layoutMap);
+          getVectorSizes(op, useConfiguredVectorSizes);
       if (vectorSizesAndScalableDims) {
         std::tie(vectorSizes, scalableVecDims) = *vectorSizesAndScalableDims;
       }
