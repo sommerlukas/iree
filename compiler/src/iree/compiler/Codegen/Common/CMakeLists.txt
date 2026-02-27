@@ -166,6 +166,7 @@ iree_cc_library(
     "UnrollAnnotatedLoops.cpp"
     "UserConfig.cpp"
     "VectorLayoutAnalysis.cpp"
+    "VectorTileSizeAnalysis.cpp"
     "VectorTransferLowering.cpp"
     "VectorizeMemrefCopy.cpp"
     "VerifyWorkgroupDistribution.cpp"
