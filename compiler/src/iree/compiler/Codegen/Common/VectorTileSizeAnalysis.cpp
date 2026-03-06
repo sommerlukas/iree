@@ -9,9 +9,12 @@
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 
 #include "llvm/Support/DebugLog.h"
+#include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+#include "mlir/Analysis/DataFlow/Utils.h"
+#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/SymbolTable.h"
 
 #include "llvm/ADT/SmallSet.h"
 
@@ -24,11 +27,21 @@ using namespace IREE::VectorExt;
 using TileSizeSet = llvm::SmallSet<int64_t, 2>;
 
 /// Per-dimension tile size candidates. Each dimension has an independent set
-/// of candidate tile sizes.
+/// of candidate tile sizes. Satisfies the requirements for use as a
+/// `Lattice<ValueT>` value type.
 class TileSizeCandidates {
 public:
   TileSizeCandidates() = default;
   explicit TileSizeCandidates(unsigned rank) : dims(rank) {}
+
+  /// Construct from a single concrete tile size (one value per dimension).
+  static TileSizeCandidates fromSizes(ArrayRef<int64_t> sizes) {
+    TileSizeCandidates result(sizes.size());
+    for (unsigned i = 0; i < sizes.size(); ++i) {
+      result.dims[i].insert(sizes[i]);
+    }
+    return result;
+  }
 
   unsigned rank() const { return dims.size(); }
   bool empty() const { return dims.empty(); }
@@ -43,23 +56,6 @@ public:
     for (unsigned i = 0; i < rank(); ++i) {
       for (int64_t v : other.dims[i]) {
         changed |= dims[i].insert(v).second;
-      }
-    }
-    return changed;
-  }
-
-  /// Merge a single concrete tile size (one value per dimension).
-  /// Values of -1 (unknown) are skipped. If this object is uninitialized
-  /// (rank 0), it is initialized from the size of `concreteSizes`.
-  bool merge(ArrayRef<int64_t> concreteSizes) {
-    if (empty()) {
-      dims.resize(concreteSizes.size());
-    }
-    assert(rank() == concreteSizes.size() && "rank mismatch");
-    bool changed = false;
-    for (unsigned i = 0; i < rank(); ++i) {
-      if (concreteSizes[i] != -1) {
-        changed |= dims[i].insert(concreteSizes[i]).second;
       }
     }
     return changed;
@@ -107,6 +103,40 @@ public:
     return result;
   }
 
+  /// Lattice join: per-dimension set union. Uninitialized is identity.
+  static TileSizeCandidates join(const TileSizeCandidates &lhs,
+                                 const TileSizeCandidates &rhs) {
+    if (lhs.empty()) {
+      return rhs;
+    }
+    if (rhs.empty()) {
+      return lhs;
+    }
+    TileSizeCandidates result = lhs;
+    result.merge(rhs);
+    return result;
+  }
+
+  /// Lattice meet: same as join (both directions accumulate via set union).
+  static TileSizeCandidates meet(const TileSizeCandidates &lhs,
+                                 const TileSizeCandidates &rhs) {
+    return join(lhs, rhs);
+  }
+
+  bool operator==(const TileSizeCandidates &rhs) const {
+    return dims == rhs.dims;
+  }
+
+  void print(raw_ostream &os) const {
+    os << "[";
+    llvm::interleaveComma(dims, os, [&](const TileSizeSet &s) {
+      os << "{";
+      llvm::interleaveComma(s, os);
+      os << "}";
+    });
+    os << "]";
+  }
+
 private:
   SmallVector<TileSizeSet> dims;
 };
@@ -143,269 +173,248 @@ static bool isDuplicatable(Value val) {
   return false;
 }
 
-struct TileSizeState {
-  void propagateForward(Value val);
-  void propagateBackward(Value val);
+//===----------------------------------------------------------------------===//
+// Lattice and analysis definitions
+//===----------------------------------------------------------------------===//
 
-  /// Merge candidates into a value and enqueue if anything changed.
-  void mergeAndEnqueue(Value val, const TileSizeCandidates &candidates) {
-    if (!isa<ShapedType>(val.getType())) {
-      return;
-    }
-    if (candidates.empty()) {
-      return;
-    }
-    // If val is not yet in the map, inserting it may rehash the DenseMap
-    // and invalidate `candidates` if it aliases an existing entry. Copy
-    // directly into the new entry to avoid the dangling reference.
-    if (!tileSizes.count(val)) {
-      tileSizes[val] = candidates;
-    } else {
-      if (!tileSizes[val].merge(candidates)) {
-        return;
-      }
-    }
-    // We don't forward multiple alternatives from operations that are easy to
-    // duplicate. CSE will deduplicate DPS init operands, creating edges between
-    // unrelated compute operations. Propagating different vector tile sizes via
-    // shared DPS inits doesn't provide any value in that case.
-    if (isDuplicatable(val) && tileSizes[val].hasAlternatives()) {
-      return;
-    }
-    // Propagate the update.
-    forward.push(val);
-    backward.push(val);
-  }
-
-  /// Convenience: merge a single concrete tile size and enqueue if changed.
-  void mergeAndEnqueue(Value val, ArrayRef<int64_t> concreteSizes) {
-    TileSizeCandidates candidates(concreteSizes.size());
-    candidates.merge(concreteSizes);
-    mergeAndEnqueue(val, candidates);
-  }
-
-  bool hasTileSize(Value val) const { return tileSizes.count(val); }
-
-  const TileSizeCandidates &getCandidates(Value val) const {
-    static const TileSizeCandidates empty;
-    auto it = tileSizes.find(val);
-    if (it == tileSizes.end()) {
-      return empty;
-    }
-    return it->second;
-  }
-
-  /// Propagate through a linalg.generic: given known tile sizes on some
-  /// operands, infer tile sizes for other operands via indexing maps.
-  void propagateGenericOp(linalg::GenericOp genericOp);
-
-  DenseMap<Value, TileSizeCandidates> tileSizes;
-  std::queue<Value> forward;
-  std::queue<Value> backward;
+class TileSizeLattice : public dataflow::Lattice<TileSizeCandidates> {
+public:
+  using Lattice::Lattice;
 };
 
-/// Collect per-dimension tile size candidate sets from a linalg op's operands.
-/// Returns a TileSizeCandidates of size numLoops, where each dimension is the
-/// union of all candidate tile sizes for that iteration dimension across all
-/// operands.
-static TileSizeCandidates
-getIterationSpaceTileSizes(linalg::LinalgOp linalgOp,
-                           const TileSizeState &state) {
+/// Read the TileSizeCandidates from a lattice, returning empty candidates
+/// if the lattice value is duplicatable with alternatives.
+static const TileSizeCandidates &
+getCandidatesFor(Value val, const TileSizeLattice *lattice) {
+  static const TileSizeCandidates empty;
+  if (!lattice) {
+    return empty;
+  }
+  auto &candidates = lattice->getValue();
+  if (candidates.empty()) {
+    return empty;
+  }
+  if (isDuplicatable(val) && candidates.hasAlternatives()) {
+    return empty;
+  }
+  return candidates;
+}
+
+/// Gather tile size candidates into the iteration space of a linalg op by
+/// looking up each operand value's candidates via `getCandidates`.
+static TileSizeCandidates getIterationSpaceTileSizes(
+    linalg::LinalgOp linalgOp,
+    function_ref<const TileSizeCandidates &(Value)> getCandidates) {
   unsigned numLoops = linalgOp.getNumLoops();
-  TileSizeCandidates result(numLoops);
+  TileSizeCandidates iterCandidates(numLoops);
   for (OpOperand &operand : linalgOp->getOpOperands()) {
-    auto &candidates = state.getCandidates(operand.get());
+    auto &candidates = getCandidates(operand.get());
     if (candidates.empty()) {
       continue;
     }
     AffineMap map = linalgOp.getMatchingIndexingMap(&operand);
     auto mapped = candidates.mapToIterationSpace(map, numLoops);
-    result.merge(mapped);
+    iterCandidates.merge(mapped);
   }
-  return result;
+  return iterCandidates;
 }
 
-void TileSizeState::propagateGenericOp(linalg::GenericOp genericOp) {
-  auto perDimSizes = getIterationSpaceTileSizes(genericOp, *this);
+/// Forward analysis: propagates tile size candidates from operands to results.
+/// Control flow through scf.for/scf.if is handled automatically by the
+/// framework via RegionBranchOpInterface.
+class TileSizeForwardAnalysis
+    : public dataflow::SparseForwardDataFlowAnalysis<TileSizeLattice> {
+public:
+  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
 
-  // Map per-dimension iteration-space candidates to each operand's dimensions
-  // via its indexing map.
-  for (OpOperand &operand : genericOp->getOpOperands()) {
-    AffineMap map = genericOp.getMatchingIndexingMap(&operand);
-    auto operandCandidates = perDimSizes.mapFromIterationSpace(map);
-    if (operandCandidates.empty()) {
-      continue;
-    }
-    mergeAndEnqueue(operand.get(), operandCandidates);
+  LogicalResult initialize(Operation *top) override {
+    // Seed to_layout anchors before the regular initialization. This ensures
+    // seeds are set even for to_layout ops in regions that DeadCodeAnalysis
+    // hasn't yet marked as live during init.
+    top->walk([&](ToLayoutOp toLayout) {
+      LDBG() << "Anchor: " << toLayout;
+      auto candidates = TileSizeCandidates::fromSizes(
+          toLayout.getLayout().getUndistributedShape());
+      auto *lattice = getLatticeElement(toLayout.getResult());
+      propagateIfChanged(lattice, lattice->join(candidates));
+    });
+    return SparseForwardDataFlowAnalysis::initialize(top);
   }
 
-  // Propagate to results via their corresponding init operands.
-  for (auto [init, result] :
-       llvm::zip_equal(genericOp.getDpsInits(), genericOp.getResults())) {
-    mergeAndEnqueue(result, getCandidates(init));
+  void setToEntryState(TileSizeLattice *lattice) override {
+    // Entry state is uninitialized (identity for join).
+    propagateIfChanged(lattice, lattice->join(TileSizeCandidates()));
   }
-}
 
-void TileSizeState::propagateForward(Value val) {
-  auto &candidates = getCandidates(val);
-  if (candidates.empty()) {
-    return;
-  }
-  LDBG() << "Propagating tile size forward for: " << val;
-
-  for (OpOperand &use : val.getUses()) {
-    Operation *user = use.getOwner();
-    unsigned operandIdx = use.getOperandNumber();
-
-    // scf.for: propagate to tied loop body arg and result.
-    if (auto forOp = dyn_cast<scf::ForOp>(user)) {
-      Value arg = forOp.getTiedLoopRegionIterArg(&use);
-      Value result = forOp.getTiedLoopResult(&use);
-      mergeAndEnqueue(arg, candidates);
-      mergeAndEnqueue(result, candidates);
-      continue;
-    }
-
-    // scf.yield: propagate to parent op's results/args.
-    if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
-      Operation *parentOp = yieldOp->getParentOp();
-      if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
-        Value arg = forOp.getRegionIterArg(operandIdx);
-        Value result = forOp->getResult(operandIdx);
-        mergeAndEnqueue(arg, candidates);
-        mergeAndEnqueue(result, candidates);
-        continue;
-      }
-      if (auto ifOp = dyn_cast<scf::IfOp>(parentOp)) {
-        Value result = ifOp->getResult(operandIdx);
-        mergeAndEnqueue(result, candidates);
-        continue;
-      }
-    }
-
-    // Elementwise ops: propagate to all results.
-    if (OpTrait::hasElementwiseMappableTraits(user)) {
-      for (OpResult result : user->getOpResults()) {
-        mergeAndEnqueue(result, candidates);
-      }
-      continue;
+  LogicalResult visitOperation(Operation *op,
+                               ArrayRef<const TileSizeLattice *> operands,
+                               ArrayRef<TileSizeLattice *> results) override {
+    // to_layout: don't propagate operand forward (anchor boundary).
+    // Seeding is done in initialize().
+    if (isa<ToLayoutOp>(op)) {
+      return success();
     }
 
     // linalg.generic: propagate through indexing maps.
-    if (auto genericOp = dyn_cast<linalg::GenericOp>(user)) {
-      propagateGenericOp(genericOp);
-      continue;
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+      unsigned numLoops = genericOp.getNumLoops();
+      TileSizeCandidates iterCandidates(numLoops);
+      for (OpOperand &operand : genericOp->getOpOperands()) {
+        auto &candidates = getCandidatesFor(
+            operand.get(), operands[operand.getOperandNumber()]);
+        if (candidates.empty()) {
+          continue;
+        }
+        AffineMap map = genericOp.getMatchingIndexingMap(&operand);
+        iterCandidates.merge(candidates.mapToIterationSpace(map, numLoops));
+      }
+      for (unsigned i = 0; i < genericOp.getNumDpsInits(); ++i) {
+        OpOperand *init = genericOp.getDpsInitOperand(i);
+        AffineMap map = genericOp.getMatchingIndexingMap(init);
+        auto resultCandidates = iterCandidates.mapFromIterationSpace(map);
+        if (!resultCandidates.empty()) {
+          propagateIfChanged(results[i], results[i]->join(resultCandidates));
+        }
+      }
+      return success();
     }
+
+    // Elementwise ops: propagate to all results.
+    if (OpTrait::hasElementwiseMappableTraits(op)) {
+      for (auto [operandLattice, operandVal] :
+           llvm::zip(operands, op->getOperands())) {
+        auto &candidates = getCandidatesFor(operandVal, operandLattice);
+        if (candidates.empty()) {
+          continue;
+        }
+        for (TileSizeLattice *result : results) {
+          propagateIfChanged(result, result->join(candidates));
+        }
+      }
+      return success();
+    }
+
+    return success();
   }
+};
+
+/// Backward analysis: propagates tile size candidates from results to operands.
+/// Control flow through scf.for/scf.if is handled automatically by the
+/// framework via RegionBranchOpInterface.
+class TileSizeBackwardAnalysis
+    : public dataflow::SparseBackwardDataFlowAnalysis<TileSizeLattice> {
+public:
+  using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
+
+  void setToExitState(TileSizeLattice *lattice) override {
+    // Exit state is uninitialized (identity for meet).
+  }
+
+  LogicalResult
+  visitOperation(Operation *op, ArrayRef<TileSizeLattice *> operands,
+                 ArrayRef<const TileSizeLattice *> results) override {
+    // to_layout: propagate result tile sizes backward to input.
+    if (auto toLayout = dyn_cast<ToLayoutOp>(op)) {
+      auto &candidates = getCandidatesFor(toLayout.getResult(), results[0]);
+      if (!candidates.empty()) {
+        TileSizeLattice *inputLattice = operands[0];
+        propagateIfChanged(inputLattice, inputLattice->meet(candidates));
+      }
+      return success();
+    }
+
+    // linalg.generic: propagate through indexing maps.
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+      unsigned numLoops = genericOp.getNumLoops();
+      TileSizeCandidates iterCandidates(numLoops);
+      // Gather result candidates into iteration space via DPS init maps.
+      for (auto [result, resultLattice] :
+           llvm::zip(genericOp.getResults(), results)) {
+        auto &candidates = getCandidatesFor(result, resultLattice);
+        if (candidates.empty()) {
+          continue;
+        }
+        unsigned resultIdx = cast<OpResult>(result).getResultNumber();
+        OpOperand *init = genericOp.getDpsInitOperand(resultIdx);
+        AffineMap map = genericOp.getMatchingIndexingMap(init);
+        iterCandidates.merge(candidates.mapToIterationSpace(map, numLoops));
+      }
+      // Gather operand candidates into iteration space.
+      for (OpOperand &operand : genericOp->getOpOperands()) {
+        auto &candidates = getCandidatesFor(
+            operand.get(), operands[operand.getOperandNumber()]);
+        if (candidates.empty()) {
+          continue;
+        }
+        AffineMap map = genericOp.getMatchingIndexingMap(&operand);
+        iterCandidates.merge(candidates.mapToIterationSpace(map, numLoops));
+      }
+      // Map iteration space candidates back to each operand.
+      for (OpOperand &operand : genericOp->getOpOperands()) {
+        AffineMap map = genericOp.getMatchingIndexingMap(&operand);
+        auto operandCandidates = iterCandidates.mapFromIterationSpace(map);
+        if (operandCandidates.empty()) {
+          continue;
+        }
+        TileSizeLattice *operandLattice = operands[operand.getOperandNumber()];
+        propagateIfChanged(operandLattice,
+                           operandLattice->meet(operandCandidates));
+      }
+      return success();
+    }
+
+    // Elementwise ops: propagate to all operands.
+    if (OpTrait::hasElementwiseMappableTraits(op)) {
+      for (auto [resultVal, resultLattice] :
+           llvm::zip(op->getResults(), results)) {
+        auto &candidates = getCandidatesFor(resultVal, resultLattice);
+        if (candidates.empty()) {
+          continue;
+        }
+        for (auto [operandLattice, operandVal] :
+             llvm::zip(operands, op->getOperands())) {
+          if (!isa<ShapedType>(operandVal.getType())) {
+            continue;
+          }
+          propagateIfChanged(operandLattice, operandLattice->meet(candidates));
+        }
+      }
+      return success();
+    }
+
+    return success();
+  }
+
+  void visitBranchOperand(OpOperand &operand) override {}
+  void visitCallOperand(OpOperand &operand) override {}
+  void
+  visitNonControlFlowArguments(RegionSuccessor &successor,
+                               ArrayRef<BlockArgument> arguments) override {}
+};
+
+//===----------------------------------------------------------------------===//
+// Result querying
+//===----------------------------------------------------------------------===//
+
+/// Collect per-dimension tile size candidate sets from a linalg op's operands,
+/// querying the solver for lattice state.
+static TileSizeCandidates
+getIterationSpaceTileSizes(linalg::LinalgOp linalgOp,
+                           const DataFlowSolver &solver) {
+  return getIterationSpaceTileSizes(
+      linalgOp, [&](Value v) -> const TileSizeCandidates & {
+        auto *lattice = solver.lookupState<TileSizeLattice>(v);
+        return getCandidatesFor(v, lattice);
+      });
 }
 
-void TileSizeState::propagateBackward(Value val) {
-  LDBG() << "Propagating tile size backward for: " << val;
-  auto &candidates = getCandidates(val);
-  if (candidates.empty()) {
-    return;
-  }
-
-  // Block arguments (e.g., scf.for iter_args).
-  if (auto blockArg = dyn_cast<BlockArgument>(val)) {
-    Operation *parent = val.getParentBlock()->getParentOp();
-    if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
-      OpOperand *yielded = forOp.getTiedLoopYieldedValue(blockArg);
-      OpOperand *init = forOp.getTiedLoopInit(blockArg);
-      if (yielded) {
-        mergeAndEnqueue(yielded->get(), candidates);
-      }
-      if (init) {
-        mergeAndEnqueue(init->get(), candidates);
-      }
-    }
-    return;
-  }
-
-  Operation *defOp = val.getDefiningOp();
-  if (!defOp) {
-    return;
-  }
-
-  // Elementwise ops: propagate to all operands.
-  if (OpTrait::hasElementwiseMappableTraits(defOp)) {
-    for (OpOperand &operand : defOp->getOpOperands()) {
-      if (isa<ShapedType>(operand.get().getType())) {
-        mergeAndEnqueue(operand.get(), candidates);
-      }
-    }
-    return;
-  }
-
-  // linalg.generic: propagate through indexing maps.
-  if (auto genericOp = dyn_cast<linalg::GenericOp>(defOp)) {
-    unsigned resultIdx = cast<OpResult>(val).getResultNumber();
-    mergeAndEnqueue(genericOp.getDpsInitOperand(resultIdx)->get(), candidates);
-    propagateGenericOp(genericOp);
-    return;
-  }
-
-  // to_layout: propagate to input.
-  // We only propagate backward for to_layout, not forward, as to_layout is an
-  // anchor for initialization itself.
-  if (auto toLayout = dyn_cast<ToLayoutOp>(defOp)) {
-    mergeAndEnqueue(toLayout.getInput(), candidates);
-    return;
-  }
-
-  // scf.for results: propagate to yield and init.
-  if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-    unsigned resultIdx = cast<OpResult>(val).getResultNumber();
-    Value init = forOp.getInits()[resultIdx];
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    mergeAndEnqueue(init, candidates);
-    mergeAndEnqueue(yieldOp.getOperand(resultIdx), candidates);
-    return;
-  }
-
-  // scf.if results: propagate to yields in both regions.
-  if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-    unsigned resultIdx = cast<OpResult>(val).getResultNumber();
-    auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
-    mergeAndEnqueue(thenYield.getOperand(resultIdx), candidates);
-    assert(ifOp.elseBlock() && "scf.if with results must have an else block");
-    auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
-    mergeAndEnqueue(elseYield.getOperand(resultIdx), candidates);
-    return;
-  }
-}
-
-/// Run the VectorTileSizeAnalysis on the given root operation.
-static void runAnalysis(Operation *root, TileSizeState &state) {
-  // Initialize from to_layout anchors.
-  root->walk([&](ToLayoutOp toLayout) {
-    SmallVector<int64_t> undistShape =
-        toLayout.getLayout().getUndistributedShape();
-    LDBG() << "Anchor: " << toLayout;
-    state.mergeAndEnqueue(toLayout.getResult(), undistShape);
-  });
-
-  // Fixpoint iteration: forward first, then backward.
-  while (!state.forward.empty() || !state.backward.empty()) {
-    if (!state.forward.empty()) {
-      Value val = state.forward.front();
-      state.forward.pop();
-      state.propagateForward(val);
-    } else {
-      Value val = state.backward.front();
-      state.backward.pop();
-      state.propagateBackward(val);
-    }
-  }
-}
-
-/// Given a linalg op and the analysis state, compute per-dimension sets of
+/// Given a linalg op and the solver, compute per-dimension sets of
 /// candidate tile sizes. Returns a vector of size numLoops, where each entry
 /// is the deduplicated set of tile sizes for that iteration dimension.
 /// Returns an empty vector if any dimension has no candidates.
 static SmallVector<SmallVector<int64_t>>
-getPerDimTileSizes(linalg::LinalgOp linalgOp, const TileSizeState &state) {
-  auto perDimSizes = getIterationSpaceTileSizes(linalgOp, state);
+getPerDimTileSizes(linalg::LinalgOp linalgOp, const DataFlowSolver &solver) {
+  auto perDimSizes = getIterationSpaceTileSizes(linalgOp, solver);
 
   // Return empty if any dimension has no candidates.
   SmallVector<SmallVector<int64_t>> results;
@@ -435,11 +444,18 @@ public:
   void runOnOperation() override {
     auto funcOp = getOperation();
 
-    TileSizeState state;
-    runAnalysis(funcOp, state);
+    DataFlowSolver solver;
+    dataflow::loadBaselineAnalyses(solver);
+    solver.load<TileSizeForwardAnalysis>();
+    SymbolTableCollection symbolTable;
+    solver.load<TileSizeBackwardAnalysis>(symbolTable);
+
+    if (failed(solver.initializeAndRun(funcOp))) {
+      return signalPassFailure();
+    }
 
     funcOp->walk([&](linalg::LinalgOp linalgOp) {
-      auto perDimSizes = getPerDimTileSizes(linalgOp, state);
+      auto perDimSizes = getPerDimTileSizes(linalgOp, solver);
       if (perDimSizes.empty()) {
         return;
       }
