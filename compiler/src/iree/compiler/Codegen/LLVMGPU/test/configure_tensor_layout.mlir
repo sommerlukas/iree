@@ -420,3 +420,231 @@ func.func @contraction_ceildiv_batch(%lhs: tensor<1x1x63xf16>,
 // CHECK-DAG: %[[RHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$NESTED1]])
 // CHECK: linalg.generic
 // CHECK-SAME: ins(%[[LHS]], %[[RHS]]
+
+// -----
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [64, 1, 1]
+                                              subgroup_size = 64>
+
+func.func @copy_global_load_dma_3d_f16(
+    %in : tensor<1x64x64xf16>) -> tensor<1x64x64xf16>
+    attributes {
+      hal.executable.target = #exec_target,
+      translation_info = #translation
+    } {
+  %empty = tensor.empty() : tensor<1x64x64xf16>
+  %copied = linalg.copy
+            {lowering_config = #iree_gpu.use_global_load_dma}
+            ins(%in : tensor<1x64x64xf16>)
+            outs(%empty : tensor<1x64x64xf16>) -> tensor<1x64x64xf16>
+  func.return %copied : tensor<1x64x64xf16>
+}
+
+//      CHECK: #[[$LAYOUT:.+]] = #iree_vector_ext.nested_layout<
+// CHECK-SAME:   subgroup_tile = [1, 1, 1],
+// CHECK-SAME:   batch_tile = [1, 8, 1],
+// CHECK-SAME:   thread_tile = [1, 8, 8],
+// CHECK-SAME:   element_tile = [1, 1, 8],
+// CHECK-SAME:   subgroup_strides = [0, 0, 0],
+// CHECK-SAME:   thread_strides = [0, 8, 1]>
+
+// CHECK-LABEL: func.func @copy_global_load_dma_3d_f16
+// CHECK: %[[OUT:.+]] = linalg.copy
+// CHECK: to_layout %[[OUT]] to layout(#[[$LAYOUT]])
+
+// -----
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [256, 1, 1]
+                                              subgroup_size = 64>
+
+func.func @copy_global_load_dma_multi_subgroup(
+    %in : tensor<1x64x128xf16>) -> tensor<1x64x128xf16>
+    attributes {
+      hal.executable.target = #exec_target,
+      translation_info = #translation
+    } {
+  %empty = tensor.empty() : tensor<1x64x128xf16>
+  %copied = linalg.copy
+            {lowering_config = #iree_gpu.use_global_load_dma}
+            ins(%in : tensor<1x64x128xf16>)
+            outs(%empty : tensor<1x64x128xf16>) -> tensor<1x64x128xf16>
+  func.return %copied : tensor<1x64x128xf16>
+}
+
+//      CHECK: #[[$LAYOUT:.+]] = #iree_vector_ext.nested_layout<
+// CHECK-SAME:   subgroup_tile = [1, 4, 1],
+// CHECK-SAME:   batch_tile = [1, 4, 1],
+// CHECK-SAME:   thread_tile = [1, 4, 16],
+// CHECK-SAME:   element_tile = [1, 1, 8],
+// CHECK-SAME:   subgroup_strides = [0, 1, 0],
+// CHECK-SAME:   thread_strides = [0, 16, 1]>
+
+// CHECK-LABEL: func.func @copy_global_load_dma_multi_subgroup
+// CHECK: %[[OUT:.+]] = linalg.copy
+// CHECK: to_layout %[[OUT]] to layout(#[[$LAYOUT]])
+
+// -----
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [64, 1, 1]
+                                              subgroup_size = 64>
+
+func.func @copy_global_load_dma_f32(
+    %in : tensor<1x64x64xf32>) -> tensor<1x64x64xf32>
+    attributes {
+      hal.executable.target = #exec_target,
+      translation_info = #translation
+    } {
+  %empty = tensor.empty() : tensor<1x64x64xf32>
+  %copied = linalg.copy
+            {lowering_config = #iree_gpu.use_global_load_dma}
+            ins(%in : tensor<1x64x64xf32>)
+            outs(%empty : tensor<1x64x64xf32>) -> tensor<1x64x64xf32>
+  func.return %copied : tensor<1x64x64xf32>
+}
+
+//      CHECK: #[[$LAYOUT:.+]] = #iree_vector_ext.nested_layout<
+// CHECK-SAME:   subgroup_tile = [1, 1, 1],
+// CHECK-SAME:   batch_tile = [1, 16, 1],
+// CHECK-SAME:   thread_tile = [1, 4, 16],
+// CHECK-SAME:   element_tile = [1, 1, 4],
+// CHECK-SAME:   subgroup_strides = [0, 0, 0],
+// CHECK-SAME:   thread_strides = [0, 16, 1]>
+
+// CHECK-LABEL: func.func @copy_global_load_dma_f32
+// CHECK: %[[OUT:.+]] = linalg.copy
+// CHECK: to_layout %[[OUT]] to layout(#[[$LAYOUT]])
+
+// -----
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [256, 1, 1]
+                                              subgroup_size = 64>
+
+func.func @copy_global_load_dma_subgroup_fallback(
+    %in : tensor<1x48x64xf16>) -> tensor<1x48x64xf16>
+    attributes {
+      hal.executable.target = #exec_target,
+      translation_info = #translation
+    } {
+  %empty = tensor.empty() : tensor<1x48x64xf16>
+  %copied = linalg.copy
+            {lowering_config = #iree_gpu.use_global_load_dma}
+            ins(%in : tensor<1x48x64xf16>)
+            outs(%empty : tensor<1x48x64xf16>) -> tensor<1x48x64xf16>
+  func.return %copied : tensor<1x48x64xf16>
+}
+
+//      CHECK: #[[$LAYOUT:.+]] = #iree_vector_ext.nested_layout<
+// CHECK-SAME:   subgroup_tile = [1, 3, 1],
+// CHECK-SAME:   batch_tile = [1, 2, 1],
+// CHECK-SAME:   thread_tile = [1, 8, 8],
+// CHECK-SAME:   element_tile = [1, 1, 8],
+// CHECK-SAME:   subgroup_strides = [0, 1, 0],
+// CHECK-SAME:   thread_strides = [0, 8, 1]>
+
+// CHECK-LABEL: func.func @copy_global_load_dma_subgroup_fallback
+// CHECK: %[[OUT:.+]] = linalg.copy
+// CHECK: to_layout %[[OUT]] to layout(#[[$LAYOUT]])
+
+// -----
+
+// Test use_global_load_dma layout where the 128-bit DMA size fails but the
+// 32-bit DMA size succeeds.
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [64, 1, 1]
+                                              subgroup_size = 64>
+
+func.func @copy_global_load_dma_smaller_dma_size(
+    %in : tensor<1x64x4xf16>) -> tensor<1x64x4xf16>
+    attributes {
+      hal.executable.target = #exec_target,
+      translation_info = #translation
+    } {
+  %empty = tensor.empty() : tensor<1x64x4xf16>
+  %copied = linalg.copy
+            {lowering_config = #iree_gpu.use_global_load_dma}
+            ins(%in : tensor<1x64x4xf16>)
+            outs(%empty : tensor<1x64x4xf16>) -> tensor<1x64x4xf16>
+  func.return %copied : tensor<1x64x4xf16>
+}
+
+//      CHECK: #[[$LAYOUT:.+]] = #iree_vector_ext.nested_layout<
+// CHECK-SAME:   subgroup_tile = [1, 1, 1],
+// CHECK-SAME:   batch_tile = [1, 2, 1],
+// CHECK-SAME:   thread_tile = [1, 32, 2],
+// CHECK-SAME:   element_tile = [1, 1, 2],
+// CHECK-SAME:   subgroup_strides = [0, 0, 0],
+// CHECK-SAME:   thread_strides = [0, 2, 1]>
+
+// CHECK-LABEL: func.func @copy_global_load_dma_smaller_dma_size
+// CHECK: %[[OUT:.+]] = linalg.copy
+// CHECK: to_layout %[[OUT]] to layout(#[[$LAYOUT]])

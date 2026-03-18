@@ -10,11 +10,13 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "mlir/Dialect/AMDGPU/Utils/Chipset.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 
 #define DEBUG_TYPE "iree-llvmgpu-configure-vector-layouts"
@@ -397,6 +399,207 @@ static LogicalResult setDerivedThreadConfigLayout(
   return success();
 }
 
+/// Compute strides for a tile from innermost to outermost.
+static SmallVector<int64_t> computeStrides(ArrayRef<int64_t> tile) {
+  SmallVector<int64_t> strides(tile.size(), 0);
+  int64_t currStride = 1;
+  for (int64_t i = tile.size() - 1; i >= 0; --i) {
+    strides[i] = currStride;
+    currStride *= tile[i];
+  }
+  return strides;
+}
+
+/// Distribute `total` units across dimensions of `remaining` from innermost to
+/// outermost. Each dimension must evenly divide into or be evenly divided by
+/// the residual. Updates `remaining` in place.
+static LogicalResult
+distributeFromInnermost(int64_t total, MutableArrayRef<int64_t> tile,
+                        MutableArrayRef<int64_t> remaining) {
+  int64_t residual = total;
+  for (int64_t i = remaining.size() - 1; i >= 0; --i) {
+    int64_t dim = remaining[i];
+    int64_t t;
+    // Dimension fits entirely into the residual; consume it all.
+    if (residual % dim == 0) {
+      t = dim;
+      // Residual fits into the dimension; consume only what we need.
+    } else if (dim % residual == 0) {
+      t = residual;
+      // Neither divides the other; cannot distribute evenly.
+    } else {
+      return failure();
+    }
+
+    tile[i] = t;
+    remaining[i] /= t;
+    residual /= t;
+  }
+
+  return success(residual == 1);
+}
+
+/// Like distributeFromInnermost, but distributes from outermost to innermost.
+static LogicalResult
+distributeFromOutermost(int64_t total, MutableArrayRef<int64_t> tile,
+                        MutableArrayRef<int64_t> remaining) {
+  int64_t residual = total;
+  for (int64_t i = 0; i < static_cast<int64_t>(remaining.size()); ++i) {
+    int64_t dim = remaining[i];
+    int64_t t;
+    if (residual % dim == 0) {
+      t = dim;
+    } else if (dim % residual == 0) {
+      t = residual;
+    } else {
+      return failure();
+    }
+
+    tile[i] = t;
+    remaining[i] /= t;
+    residual /= t;
+  }
+
+  return success(residual == 1);
+}
+
+static FailureOr<VectorLayoutInterface>
+getGlobalLoadDMALayoutForSize(MLIRContext *context, ArrayRef<int64_t> opShape,
+                              int64_t numThreads, int64_t subgroupSize,
+                              int64_t elementBitWidth, int64_t dmaSize) {
+  if (dmaSize % elementBitWidth != 0) {
+    return failure();
+  }
+
+  int64_t elementsPerDMA = dmaSize / elementBitWidth;
+  int64_t numSubgroups = numThreads / subgroupSize;
+  int64_t rank = opShape.size();
+
+  SmallVector<int64_t> remaining(opShape);
+  SmallVector<int64_t> elementTile(rank, 1);
+  SmallVector<int64_t> threadTile(rank, 1);
+  SmallVector<int64_t> subgroupTile(rank, 1);
+  SmallVector<int64_t> outerTile(rank, 1);
+
+  // 1. Element tile: fill until we reach the DMA transfer size.
+  if (failed(distributeFromInnermost(elementsPerDMA, elementTile, remaining))) {
+    return failure();
+  }
+
+  // 2. Thread tile: distribute one subgroup's worth of threads.
+  if (failed(distributeFromInnermost(subgroupSize, threadTile, remaining))) {
+    return failure();
+  }
+
+  // 3. Subgroup tile: distribute across available subgroups from outermost.
+  //    If the remaining shape doesn't evenly accommodate all subgroups,
+  //    decrement until we find a count that works (1 always succeeds).
+  for (int64_t sg = numSubgroups; sg >= 1; --sg) {
+    SmallVector<int64_t> tryRemaining(remaining);
+    std::fill(subgroupTile.begin(), subgroupTile.end(), 1);
+    if (succeeded(distributeFromOutermost(sg, subgroupTile, tryRemaining))) {
+      remaining = tryRemaining;
+      break;
+    }
+  }
+
+  // 4. Batch tile: whatever remains.
+  ArrayRef<int64_t> batchTile = remaining;
+
+  // Compute strides from innermost for both threads and subgroups.
+  SmallVector<int64_t> threadStrides = computeStrides(threadTile);
+  SmallVector<int64_t> subgroupStrides = computeStrides(subgroupTile);
+
+  return cast<VectorLayoutInterface>(NestedLayoutAttr::get(
+      context, subgroupTile, batchTile, outerTile, threadTile, elementTile,
+      subgroupStrides, threadStrides));
+}
+
+static FailureOr<VectorLayoutInterface>
+getGlobalLoadDMALayout(linalg::LinalgOp linalgOp,
+                       ArrayRef<int64_t> workgroupSize) {
+  if (!isa<linalg::CopyOp>(linalgOp.getOperation())) {
+    return failure();
+  }
+
+  IREE::GPU::TargetAttr target = getGPUTargetAttr(linalgOp);
+  if (!target) {
+    return failure();
+  }
+
+  // Global load DMA is only supported on CDNA4+ (gfx950+).
+  FailureOr<amdgpu::Chipset> chipset = amdgpu::Chipset::parse(target.getArch());
+  if (failed(chipset) || chipset->majorVersion != 9 ||
+      chipset->minorVersion < 5) {
+    return failure();
+  }
+
+  DenseI64ArrayAttr dmaSizesAttr = target.getWgp().getDmaSizes();
+  if (!dmaSizesAttr) {
+    return failure();
+  }
+
+  SmallVector<int64_t> opShape = linalgOp.getStaticLoopRanges();
+  std::optional<VectorizationTileSizes> sizes =
+      inferSizesFromIR(linalgOp, std::nullopt);
+  if (sizes.has_value()) {
+    opShape = sizes.value().vectorSizes;
+  }
+
+  // TODO: The lowering configs on compute ops could provide additional
+  // information on the tile sizes that we could propagate to make them
+  // available here in the future and better handle dynamic shapes, e.g., for
+  // padded cases.
+  if (ShapedType::isDynamicShape(opShape)) {
+    return failure();
+  }
+
+  int64_t numThreads = ShapedType::getNumElements(workgroupSize);
+  int64_t subgroupSize = target.getPreferredSubgroupSize();
+  Type elementType = getElementTypeOrSelf(linalgOp->getResultTypes()[0]);
+  int64_t elementBitWidth = elementType.getIntOrFloatBitWidth();
+
+  // Try DMA sizes in descending order, preferring larger transfers.
+  SmallVector<int64_t> dmaSizes(dmaSizesAttr.asArrayRef());
+  llvm::sort(dmaSizes, std::greater<>());
+
+  MLIRContext *context = linalgOp.getContext();
+  for (int64_t dmaSize : dmaSizes) {
+    auto layout = getGlobalLoadDMALayoutForSize(
+        context, opShape, numThreads, subgroupSize, elementBitWidth, dmaSize);
+    if (succeeded(layout)) {
+      return layout;
+    }
+  }
+
+  return failure();
+}
+
+static LogicalResult setGlobalLoadDMALayout(
+    IREE::GPU::UseGlobalLoadDMAAttr config, linalg::LinalgOp linalgOp,
+    ArrayRef<int64_t> workgroupSize, RewriterBase &rewriter) {
+  FailureOr<VectorLayoutInterface> layout =
+      getGlobalLoadDMALayout(linalgOp, workgroupSize);
+  if (failed(layout)) {
+    // Fall back to derived thread config layout.
+    auto fallbackConfig =
+        IREE::GPU::DerivedThreadConfigAttr::get(rewriter.getContext());
+    return setDerivedThreadConfigLayout(fallbackConfig, linalgOp, workgroupSize,
+                                        rewriter);
+  }
+
+  Location loc = linalgOp.getLoc();
+  rewriter.setInsertionPointAfter(linalgOp);
+  for (OpResult result : linalgOp->getResults()) {
+    VectorLayoutInterface resultLayout =
+        layout->apply(linalgOp.getIndexingMapMatchingResult(result));
+    auto toLayout = ToLayoutOp::create(rewriter, loc, result, resultLayout);
+    rewriter.replaceAllUsesExcept(result, toLayout, toLayout);
+  }
+
+  return success();
+}
+
 static LogicalResult setIntrinsicLoweringConfigLayout(
     IREE::GPU::LoweringConfigAttr config, linalg::LinalgOp candidate,
     ArrayRef<int64_t> workgroupSize, RewriterBase &rewriter) {
@@ -528,6 +731,10 @@ struct LLVMGPUConfigureTensorLayoutsPass final
               .Case([&](IREE::GPU::DerivedThreadConfigAttr config) {
                 return setDerivedThreadConfigLayout(config, candidate,
                                                     workgroupSize, rewriter);
+              })
+              .Case([&](IREE::GPU::UseGlobalLoadDMAAttr config) {
+                return setGlobalLoadDMALayout(config, candidate, workgroupSize,
+                                              rewriter);
               })
               .Case([&](IREE::GPU::LoweringConfigAttr config) {
                 if (getMmaKind(config)) {
