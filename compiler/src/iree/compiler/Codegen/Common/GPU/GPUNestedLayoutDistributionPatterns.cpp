@@ -18,6 +18,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -408,6 +409,250 @@ struct DistributeTransferRead final
 
   Value threadId;
   int64_t subgroupSize;
+};
+
+/// Trace through single-use `to_layout` ops forward from a value to find a
+/// `vector.transfer_write`. Returns nullptr if the chain contains anything
+/// other than `to_layout`, or if any op in the chain has multiple uses.
+static vector::TransferWriteOp traceToTransferWrite(Value value) {
+  while (value) {
+    if (!value.hasOneUse()) {
+      return nullptr;
+    }
+    Operation *user = *value.getUsers().begin();
+    if (auto writeOp = dyn_cast<vector::TransferWriteOp>(user)) {
+      return writeOp;
+    }
+    auto toLayoutOp = dyn_cast<IREE::VectorExt::ToLayoutOp>(user);
+    if (!toLayoutOp) {
+      return nullptr;
+    }
+    value = toLayoutOp.getResult();
+  }
+  return nullptr;
+}
+
+/// Pattern to distribute a `vector.transfer_read` from global memory
+/// (fat_raw_buffer) followed by `vector.transfer_write` to workgroup (LDS)
+/// memory as `amdgpu.gather_to_lds`. This replaces the default VGPR-staged
+/// distribution with a direct global-to-LDS DMA.
+///
+/// Anchored on `transfer_read` because the distribution worklist processes ops
+/// in document order, and the read appears before the write. Anchoring on the
+/// write would fail because `DistributeTransferRead` would distribute the read
+/// first, destroying the value chain.
+struct DistributeTransferReadGatherToLDS final
+    : OpDistributionPattern<vector::TransferReadOp> {
+  using OpDistributionPattern::OpDistributionPattern;
+
+  DistributeTransferReadGatherToLDS(MLIRContext *context, Value threadId,
+                                    int64_t subgroupSize,
+                                    ArrayRef<int64_t> workgroupSize)
+      : OpDistributionPattern(context, /*benefit=*/2), threadId(threadId),
+        subgroupSize(subgroupSize) {
+    if (!workgroupSize.empty()) {
+      numSubgroups = llvm::product_of(workgroupSize) / subgroupSize;
+    }
+  }
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp readOp,
+                                DistributionSignature &signature,
+                                PatternRewriter &rewriter) const override {
+    // 1. Read must be from a memref (not tensor).
+    auto readMemRefType = dyn_cast<MemRefType>(readOp.getBase().getType());
+    if (!readMemRefType) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "distribution expects memrefs");
+    }
+
+    // 2. Source must be fat_raw_buffer.
+    if (!hasAMDGPUFatRawBufferAddressSpace(readMemRefType)) {
+      return rewriter.notifyMatchFailure(
+          readOp, "source is not fat_raw_buffer address space");
+    }
+
+    // 3. Must have a nested layout.
+    NestedLayoutAttr vectorLayout =
+        dyn_cast<NestedLayoutAttr>(signature[readOp.getResult()]);
+    if (!vectorLayout) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "non-nested transfer_read layout");
+    }
+
+    // 4. Trace forward through to_layout ops to find the transfer_write.
+    vector::TransferWriteOp writeOp = traceToTransferWrite(readOp.getResult());
+    if (!writeOp) {
+      return rewriter.notifyMatchFailure(
+          readOp, "could not trace to a transfer_write through to_layout ops");
+    }
+
+    // 5. Write must be to workgroup (LDS) memory.
+    auto writeMemRefType = dyn_cast<MemRefType>(writeOp.getBase().getType());
+    if (!writeMemRefType || !hasSharedMemoryAddressSpace(writeMemRefType)) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "write is not to workgroup memory");
+    }
+
+    // 6. No masks.
+    // TODO: Support masked direct-to-LDS transfers.
+    if (readOp.getMask() || writeOp.getMask()) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "masked transfers not supported");
+    }
+
+    // 7. Identity permutation maps.
+    // TODO: Support non-identity permutation maps.
+    if (!readOp.getPermutationMap().isMinorIdentity()) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "non-identity read permutation map");
+    }
+    if (!writeOp.getPermutationMap().isMinorIdentity()) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "non-identity write permutation map");
+    }
+
+    // 8. All subgroups must participate. gather_to_lds ops inside scf.if
+    // cannot be software-pipelined by ROCDLPrefetchSharedMemory.
+    // TODO: Support partial subgroup participation.
+    if (numSubgroups.has_value() &&
+        llvm::product_of(vectorLayout.getSubgroupTile()) !=
+            numSubgroups.value()) {
+      return rewriter.notifyMatchFailure(
+          readOp, "not all subgroups participate in the transfer");
+    }
+
+    // 9. Layout DMA compatibility checks.
+    int64_t rank = vectorLayout.getRank();
+    ArrayRef<int64_t> threadStrides = vectorLayout.getThreadStrides();
+    ArrayRef<int64_t> elementTile = vectorLayout.getElementTile();
+    ArrayRef<int64_t> threadTile = vectorLayout.getThreadTile();
+
+    if (rank == 0) {
+      return rewriter.notifyMatchFailure(readOp, "rank 0 not supported");
+    }
+
+    // Find the innermost dimension where threads actually distribute
+    // (thread_tile > 1). That dimension's stride must be 1 for contiguous
+    // access. If no dimension has thread_tile > 1, threads don't distribute
+    // and contiguity is trivially satisfied.
+    for (int64_t i = rank - 1; i >= 0; --i) {
+      if (threadTile[i] > 1) {
+        if (threadStrides[i] != 1) {
+          return rewriter.notifyMatchFailure(
+              readOp, "innermost distributed thread dimension does not have "
+                      "stride 1 (not contiguous)");
+        }
+        break;
+      }
+    }
+
+    // Total elements per thread per batch.
+    int64_t elementsPerThread = llvm::product_of(elementTile);
+
+    // Check transfer size matches a supported DMA size.
+    Type elementType = readMemRefType.getElementType();
+    int64_t elementBits = elementType.getIntOrFloatBitWidth();
+    int64_t transferBits = elementsPerThread * elementBits;
+
+    // Get DMA sizes from the GPU target.
+    IREE::GPU::TargetAttr target = getGPUTargetAttr(readOp);
+    if (!target) {
+      return rewriter.notifyMatchFailure(readOp, "could not find GPU target");
+    }
+    DenseI64ArrayAttr dmaSizesAttr = target.getWgp().getDmaSizes();
+    if (!dmaSizesAttr) {
+      return rewriter.notifyMatchFailure(readOp, "target has no dma_sizes");
+    }
+    bool dmaSupported =
+        llvm::is_contained(dmaSizesAttr.asArrayRef(), transferBits);
+    if (!dmaSupported) {
+      return rewriter.notifyMatchFailure(
+          readOp, "transfer size does not match any supported DMA size");
+    }
+
+    // --- All prerequisites met. Generate gather_to_lds ops. ---
+
+    SmallVector<int64_t> distShape = vectorLayout.getDistributedShape();
+    SmallVector<int64_t> tileShape = getElementVectorTileShape(vectorLayout);
+    SmallVector<Value> warpIndices, threadIndices;
+    if (failed(populateWarpAndThreadIndices(rewriter, threadId, subgroupSize,
+                                            vectorLayout, warpIndices,
+                                            threadIndices))) {
+      return rewriter.notifyMatchFailure(
+          readOp, "warp or thread tiles have overlapping strides");
+    }
+
+    // Insert gather_to_lds ops at the write's location, since the LDS
+    // allocation may be defined between the read and write.
+    rewriter.setInsertionPoint(writeOp);
+
+    Location loc = writeOp.getLoc();
+    ValueRange readIndices = readOp.getIndices();
+    ValueRange writeIndices = writeOp.getIndices();
+    AffineMap readPermMap = readOp.getPermutationMap();
+    AffineMap writePermMap = writeOp.getPermutationMap();
+
+    // Transfer type: vector of product_of(element_tile) elements.
+    VectorType transferType = VectorType::get({elementsPerThread}, elementType);
+
+    // Build zero thread indices for destination (uniform) computation.
+    // For gather_to_lds, destination indices must be subgroup-uniform,
+    // meaning the thread contribution on the innermost dimension is excluded.
+    SmallVector<Value> zeroThreadIndices;
+    zeroThreadIndices.reserve(rank);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    for (int64_t i = 0; i < rank; ++i) {
+      zeroThreadIndices.push_back(zero);
+    }
+
+    for (SmallVector<int64_t> offsets :
+         StaticTileOffsetRange(distShape, tileShape)) {
+      // Source indices (divergent per-lane): include thread contribution.
+      SmallVector<Value> srcIndices = getTransferIndicesFromNestedLayout(
+          rewriter, readIndices, offsets, vectorLayout, readPermMap,
+          warpIndices, threadIndices);
+
+      // Destination indices (uniform): use zero thread indices so the
+      // innermost thread offset is excluded.
+      SmallVector<Value> dstIndices = getTransferIndicesFromNestedLayout(
+          rewriter, writeIndices, offsets, vectorLayout, writePermMap,
+          warpIndices, zeroThreadIndices);
+
+      amdgpu::GatherToLDSOp::create(rewriter, loc, readOp.getBase(), srcIndices,
+                                    writeOp.getBase(), dstIndices,
+                                    TypeAttr::get(transferType));
+    }
+
+    // Erase the write and intermediate to_layout ops first, then the read.
+    // Collect the chain: write -> to_layout(s) -> read.
+    SmallVector<Operation *> opsToErase;
+    opsToErase.push_back(writeOp);
+    Value val = writeOp.getValueToStore();
+    while (val) {
+      Operation *defOp = val.getDefiningOp();
+      if (!defOp) {
+        break;
+      }
+      if (auto toLayoutOp = dyn_cast<IREE::VectorExt::ToLayoutOp>(defOp)) {
+        opsToErase.push_back(defOp);
+        val = toLayoutOp.getInput();
+      } else {
+        // This should be the readOp itself.
+        break;
+      }
+    }
+    opsToErase.push_back(readOp);
+
+    for (Operation *op : opsToErase) {
+      rewriter.eraseOp(op);
+    }
+
+    return success();
+  }
+
+  Value threadId;
+  int64_t subgroupSize;
+  std::optional<int64_t> numSubgroups = std::nullopt;
 };
 
 /// Pattern to distribute `vector.transfer_write` ops with nested layouts.
@@ -2211,6 +2456,8 @@ struct DistributeInnerTiled final
 void IREE::VectorExt::populateNestedLayoutDistributionPatterns(
     RewritePatternSet &patterns, Value threadId, int64_t subgroupSize,
     ArrayRef<int64_t> workgroupSize, int64_t maxBitsPerShuffle) {
+  patterns.add<DistributeTransferReadGatherToLDS>(
+      patterns.getContext(), threadId, subgroupSize, workgroupSize);
   patterns.add<DistributeTransferRead, DistributeTransferGather,
                DistributeMapStore>(patterns.getContext(), threadId,
                                    subgroupSize);

@@ -1642,3 +1642,257 @@ builtin.module attributes { transform.with_named_sequence } {
     transform.yield
   }
 }
+
+// -----
+
+// Test gather_to_lds distribution: single subgroup, 128-bit DMA, non-zero read
+// offset. Layout from copy_global_load_dma_3d_f16.
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#dma_layout = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1, 1],
+  batch_tile = [1, 8, 1],
+  outer_tile = [1, 1, 1],
+  thread_tile = [1, 8, 8],
+  element_tile = [1, 1, 8],
+  subgroup_strides = [0, 0, 0],
+  thread_strides = [0, 8, 1]
+>
+
+// CHECK-LABEL: @gather_to_lds_3d_f16
+//  CHECK-SAME:   %[[GLOBAL:.+]]: memref<1x128x128xf16, #amdgpu.address_space<fat_raw_buffer>>
+//  CHECK-SAME:   %[[OFF1:.+]]: index, %[[OFF2:.+]]: index
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//   CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
+//   CHECK-DAG:   %[[C2:.+]] = arith.constant 2 : index
+//   CHECK-DAG:   %[[C3:.+]] = arith.constant 3 : index
+//   CHECK-DAG:   %[[C4:.+]] = arith.constant 4 : index
+//   CHECK-DAG:   %[[C5:.+]] = arith.constant 5 : index
+//   CHECK-DAG:   %[[C6:.+]] = arith.constant 6 : index
+//   CHECK-DAG:   %[[C7:.+]] = arith.constant 7 : index
+//   CHECK-DAG:   %[[C8:.+]] = arith.constant 8 : index
+//   CHECK-DAG:   %[[C16:.+]] = arith.constant 16 : index
+//   CHECK-DAG:   %[[C24:.+]] = arith.constant 24 : index
+//   CHECK-DAG:   %[[C32:.+]] = arith.constant 32 : index
+//   CHECK-DAG:   %[[C40:.+]] = arith.constant 40 : index
+//   CHECK-DAG:   %[[C48:.+]] = arith.constant 48 : index
+//   CHECK-DAG:   %[[C56:.+]] = arith.constant 56 : index
+//   CHECK-DAG:   %[[TID:.+]] = gpu.thread_id x
+//       CHECK:   %[[DELIN:.+]]:3 = affine.delinearize_index %[[TID]] into (8, 8)
+//       CHECK:   %[[ALLOC:.+]] = memref.alloc() : memref<1x64x64xf16, #gpu.address_space<workgroup>>
+//       CHECK:   %[[SRC_D1_0:.+]] = affine.linearize_index [%[[DELIN]]#1, %[[OFF1]]] by (8, 1)
+//       CHECK:   %[[SRC_D2:.+]] = affine.linearize_index [%[[DELIN]]#2, %[[OFF2]]] by (8, 8)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_0]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C0]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_1:.+]] = affine.linearize_index [%[[C1]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_1]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C8]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_2:.+]] = affine.linearize_index [%[[C2]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_2]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C16]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_3:.+]] = affine.linearize_index [%[[C3]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_3]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C24]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_4:.+]] = affine.linearize_index [%[[C4]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_4]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C32]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_5:.+]] = affine.linearize_index [%[[C5]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_5]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C40]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_6:.+]] = affine.linearize_index [%[[C6]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_6]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C48]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_7:.+]] = affine.linearize_index [%[[C7]], %[[DELIN]]#1, %[[OFF1]]] by (8, 8, 1)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_7]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C56]], %[[C0]]] : vector<8xf16>
+func.func @gather_to_lds_3d_f16(
+    %global: memref<1x128x128xf16, #amdgpu.address_space<fat_raw_buffer>>,
+    %off1: index, %off2: index)
+    attributes { hal.executable.target = #exec_target } {
+  %c0 = arith.constant 0 : index
+  %pad = ub.poison : f16
+
+  %read = vector.transfer_read %global[%c0, %off1, %off2], %pad
+      {in_bounds = [true, true, true]}
+      : memref<1x128x128xf16, #amdgpu.address_space<fat_raw_buffer>>,
+        vector<1x64x64xf16>
+  %layout = iree_vector_ext.to_layout %read to layout(#dma_layout)
+      : vector<1x64x64xf16>
+
+  %alloc = memref.alloc() : memref<1x64x64xf16, #gpu.address_space<workgroup>>
+  vector.transfer_write %layout, %alloc[%c0, %c0, %c0]
+      {in_bounds = [true, true, true]}
+      : vector<1x64x64xf16>,
+        memref<1x64x64xf16, #gpu.address_space<workgroup>>
+  return
+}
+
+builtin.module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(
+      %variant_op: !transform.any_op {transform.readonly}) {
+    %top_level_func = transform.structured.match ops{["func.func"]}
+        in %variant_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.test_gpu_vector_distribution %top_level_func
+        {workgroup_size = array<i64: 64, 1, 1>} : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Test gather_to_lds distribution: 4 subgroups, 128-bit DMA.
+// Layout from copy_global_load_dma_multi_subgroup.
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#dma_layout = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 4, 1],
+  batch_tile = [1, 4, 1],
+  outer_tile = [1, 1, 1],
+  thread_tile = [1, 4, 16],
+  element_tile = [1, 1, 8],
+  subgroup_strides = [0, 1, 0],
+  thread_strides = [0, 16, 1]
+>
+
+// CHECK-LABEL: @gather_to_lds_multi_subgroup
+//  CHECK-SAME:   %[[GLOBAL:.+]]: memref<1x64x128xf16, #amdgpu.address_space<fat_raw_buffer>>
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//   CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
+//   CHECK-DAG:   %[[C2:.+]] = arith.constant 2 : index
+//   CHECK-DAG:   %[[C3:.+]] = arith.constant 3 : index
+//   CHECK-DAG:   %[[TID:.+]] = gpu.thread_id x
+//       CHECK:   %[[SG_DELIN:.+]]:3 = affine.delinearize_index %[[TID]] into (4, 64)
+//       CHECK:   %[[TH_DELIN:.+]]:3 = affine.delinearize_index %[[TID]] into (4, 16)
+//       CHECK:   %[[ALLOC:.+]] = memref.alloc() : memref<1x64x128xf16, #gpu.address_space<workgroup>>
+//       CHECK:   %[[SRC_D1_0:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C0]], %[[TH_DELIN]]#1] by (4, 4, 4)
+//       CHECK:   %[[SRC_D2:.+]] = affine.linearize_index disjoint [%[[TH_DELIN]]#2, %[[C0]]] by (16, 8)
+//       CHECK:   %[[DST_D1_0:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C0]], %[[C0]]] by (4, 4, 4)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_0]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[DST_D1_0]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_1:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C1]], %[[TH_DELIN]]#1] by (4, 4, 4)
+//       CHECK:   %[[DST_D1_1:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C1]], %[[C0]]] by (4, 4, 4)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_1]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[DST_D1_1]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_2:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C2]], %[[TH_DELIN]]#1] by (4, 4, 4)
+//       CHECK:   %[[DST_D1_2:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C2]], %[[C0]]] by (4, 4, 4)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_2]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[DST_D1_2]], %[[C0]]] : vector<8xf16>
+//       CHECK:   %[[SRC_D1_3:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C3]], %[[TH_DELIN]]#1] by (4, 4, 4)
+//       CHECK:   %[[DST_D1_3:.+]] = affine.linearize_index disjoint [%[[SG_DELIN]]#1, %[[C3]], %[[C0]]] by (4, 4, 4)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_3]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[DST_D1_3]], %[[C0]]] : vector<8xf16>
+func.func @gather_to_lds_multi_subgroup(
+    %global: memref<1x64x128xf16, #amdgpu.address_space<fat_raw_buffer>>)
+    attributes { hal.executable.target = #exec_target } {
+  %c0 = arith.constant 0 : index
+  %pad = ub.poison : f16
+
+  %read = vector.transfer_read %global[%c0, %c0, %c0], %pad
+      {in_bounds = [true, true, true]}
+      : memref<1x64x128xf16, #amdgpu.address_space<fat_raw_buffer>>,
+        vector<1x64x128xf16>
+  %layout = iree_vector_ext.to_layout %read to layout(#dma_layout)
+      : vector<1x64x128xf16>
+
+  %alloc = memref.alloc() : memref<1x64x128xf16, #gpu.address_space<workgroup>>
+  vector.transfer_write %layout, %alloc[%c0, %c0, %c0]
+      {in_bounds = [true, true, true]}
+      : vector<1x64x128xf16>,
+        memref<1x64x128xf16, #gpu.address_space<workgroup>>
+  return
+}
+
+builtin.module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(
+      %variant_op: !transform.any_op {transform.readonly}) {
+    %top_level_func = transform.structured.match ops{["func.func"]}
+        in %variant_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.test_gpu_vector_distribution %top_level_func
+        {workgroup_size = array<i64: 256, 1, 1>} : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Test gather_to_lds distribution: single subgroup, 32-bit DMA.
+// Layout from copy_global_load_dma_smaller_dma_size.
+
+#gpu_target = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32|fp16, storage = b32|b16, subgroup = shuffle|arithmetic,
+  subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024],
+  max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536,
+  max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+
+#exec_target = #hal.executable.target<"rocm", "rocm-hsaco-fb",
+  {iree_codegen.target_info = #gpu_target}>
+
+#dma_layout = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1, 1],
+  batch_tile = [1, 2, 1],
+  outer_tile = [1, 1, 1],
+  thread_tile = [1, 32, 2],
+  element_tile = [1, 1, 2],
+  subgroup_strides = [0, 0, 0],
+  thread_strides = [0, 2, 1]
+>
+
+// CHECK-LABEL: @gather_to_lds_smaller_dma_size
+//  CHECK-SAME:   %[[GLOBAL:.+]]: memref<1x64x4xf16, #amdgpu.address_space<fat_raw_buffer>>
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//   CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
+//   CHECK-DAG:   %[[C32:.+]] = arith.constant 32 : index
+//   CHECK-DAG:   %[[TID:.+]] = gpu.thread_id x
+//       CHECK:   %[[DELIN:.+]]:3 = affine.delinearize_index %[[TID]] into (32, 2)
+//       CHECK:   %[[ALLOC:.+]] = memref.alloc() : memref<1x64x4xf16, #gpu.address_space<workgroup>>
+//       CHECK:   %[[SRC_D2:.+]] = affine.linearize_index disjoint [%[[DELIN]]#2, %[[C0]]] by (2, 2)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[DELIN]]#1, %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C0]], %[[C0]]] : vector<2xf16>
+//       CHECK:   %[[SRC_D1_1:.+]] = affine.linearize_index disjoint [%[[C1]], %[[DELIN]]#1] by (2, 32)
+//       CHECK:   amdgpu.gather_to_lds %[[GLOBAL]][%[[C0]], %[[SRC_D1_1]], %[[SRC_D2]]], %[[ALLOC]][%[[C0]], %[[C32]], %[[C0]]] : vector<2xf16>
+func.func @gather_to_lds_smaller_dma_size(
+    %global: memref<1x64x4xf16, #amdgpu.address_space<fat_raw_buffer>>)
+    attributes { hal.executable.target = #exec_target } {
+  %c0 = arith.constant 0 : index
+  %pad = ub.poison : f16
+
+  %read = vector.transfer_read %global[%c0, %c0, %c0], %pad
+      {in_bounds = [true, true, true]}
+      : memref<1x64x4xf16, #amdgpu.address_space<fat_raw_buffer>>,
+        vector<1x64x4xf16>
+  %layout = iree_vector_ext.to_layout %read to layout(#dma_layout)
+      : vector<1x64x4xf16>
+
+  %alloc = memref.alloc() : memref<1x64x4xf16, #gpu.address_space<workgroup>>
+  vector.transfer_write %layout, %alloc[%c0, %c0, %c0]
+      {in_bounds = [true, true, true]}
+      : vector<1x64x4xf16>,
+        memref<1x64x4xf16, #gpu.address_space<workgroup>>
+  return
+}
+
+builtin.module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(
+      %variant_op: !transform.any_op {transform.readonly}) {
+    %top_level_func = transform.structured.match ops{["func.func"]}
+        in %variant_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.test_gpu_vector_distribution %top_level_func
+        {workgroup_size = array<i64: 64, 1, 1>} : !transform.any_op
+    transform.yield
+  }
+}

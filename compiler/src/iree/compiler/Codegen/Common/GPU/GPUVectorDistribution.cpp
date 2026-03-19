@@ -39,8 +39,12 @@ struct VectorDistributionRewriter : PatternRewriter {
   VectorDistributionRewriter(MLIRContext *ctx) : PatternRewriter(ctx) {}
 };
 
-/// Custom listener to store emitted ops that needs to be distributed.
+/// Custom listener to store emitted ops that needs to be distributed and to
+/// null out erased ops in the worklist.
 struct VectorDistributionListener : RewriterBase::Listener {
+  VectorDistributionListener(std::deque<Operation *> &worklist)
+      : worklist(worklist) {}
+
   bool hasOpsToBeDistributed() { return !toBeDistributed.empty(); }
 
   void clearOpsToBeDistributed() { return toBeDistributed.clear(); }
@@ -56,7 +60,21 @@ struct VectorDistributionListener : RewriterBase::Listener {
     }
   }
 
+  void notifyOperationErased(Operation *op) override {
+    for (Operation *&entry : worklist) {
+      if (entry == op) {
+        entry = nullptr;
+      }
+    }
+    for (Operation *&entry : toBeDistributed) {
+      if (entry == op) {
+        entry = nullptr;
+      }
+    }
+  }
+
 private:
+  std::deque<Operation *> &worklist;
   std::deque<Operation *> toBeDistributed;
 };
 
@@ -64,13 +82,13 @@ static void applyVectorDistribution(Operation *root,
                                     const FrozenRewritePatternSet &patterns) {
 
   VectorDistributionRewriter rewriter(root->getContext());
-  VectorDistributionListener listener;
+  std::deque<Operation *> worklist;
+  VectorDistributionListener listener(worklist);
   rewriter.setListener(&listener);
   PatternApplicator applicator(patterns);
   applicator.applyDefaultCostModel();
 
   // Collect all the operations to be distributed.
-  std::deque<Operation *> worklist;
   LLVM_DEBUG(llvm::dbgs() << "Collecting operations to be distributed\n");
   root->walk([&](Operation *op) {
     // The distribution of mask op is special.
