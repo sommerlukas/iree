@@ -10,6 +10,7 @@
 include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.td"
 include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.td"
 include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.td"
+include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtInterfaces.td"
 include "iree/compiler/Codegen/Interfaces/HoistableRegionOpInterface.td"
 include "iree/compiler/Utils/CommonTypeConstraints.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
@@ -357,6 +358,76 @@ def IREEGPU_CoalescedGatherDMAOp : Op<IREEGPU_Dialect, "coalesced_gather_dma", [
 
     bool hasTensorSemantics() {
       return ::llvm::isa<RankedTensorType>(getInit().getType());
+    }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// AsyncDMAOp
+//===----------------------------------------------------------------------===//
+
+def IREEGPU_AsyncDMAOp : Op<IREEGPU_Dialect, "async_dma", [
+    DestinationStyleOpInterface,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    SameVariadicOperandSize]> {
+  let summary = "Asynchronous DMA operation for direct-to-LDS data movement";
+  let description = [{
+    Represents a direct-to-LDS data movement that lowers to
+    `amdgpu.gather_to_lds`. The `layout` attribute describes the transfer shape
+    and read pattern for the DMA.
+
+    This operation exists in two forms: tensor-based (value-semantic) and
+    buffer-based (memref-semantic). In tensor form, the operation returns a
+    result that aliases the `dest` operand. In memref form, the operation has
+    no result and writes directly to the `dest` memref.
+
+    Example:
+    ```mlir
+    // Tensor form:
+    %0 = iree_gpu.async_dma %src[%i, %j], %alloc[%c0, %c0], #layout
+        : tensor<20x64xf16> -> tensor<1x64xf16, #gpu.address_space<workgroup>>
+        -> tensor<1x64xf16, #gpu.address_space<workgroup>>
+    // Memref form:
+    iree_gpu.async_dma %src[%i, %j], %alloc[%c0, %c0], #layout
+        : memref<20x64xf16> -> memref<1x64xf16, #gpu.address_space<workgroup>>
+    ```
+  }];
+
+  let arguments = (ins
+    AnyRankedTensorOrMemRef:$source,
+    Variadic<Index>:$source_indices,
+    AnyRankedTensorOrMemRef:$dest,
+    Variadic<Index>:$dest_indices,
+    VectorLayoutInterface:$layout,
+    OptionalAttr<BoolArrayAttr>:$in_bounds
+  );
+
+  let results = (outs Optional<AnyRankedTensorOrMemRef>:$result);
+
+  let assemblyFormat = [{
+    $source `[` $source_indices `]` `,` $dest `[` $dest_indices `]` `,`
+    $layout (`in_bounds` $in_bounds^)?
+    attr-dict `:` type($source) `->` type($dest) (`->` type($result)^)?
+  }];
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    bool hasTensorSemantics() {
+      return ::llvm::isa<RankedTensorType>(getDest().getType());
+    }
+
+    unsigned getSourceRank() {
+      return ::llvm::cast<ShapedType>(getSource().getType()).getRank();
+    }
+
+    unsigned getDestRank() {
+      return ::llvm::cast<ShapedType>(getDest().getType()).getRank();
+    }
+
+    // DestinationStyleOpInterface
+    MutableOperandRange getDpsInitsMutable() {
+      return getDestMutable();
     }
   }];
 }
