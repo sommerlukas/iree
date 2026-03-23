@@ -520,7 +520,8 @@ struct AsyncDMAOpBufferizationInterface
     IREE::GPU::AsyncDMAOp::create(
         rewriter, dmaOp.getLoc(), TypeRange{}, *sourceBuffer,
         dmaOp.getSourceIndices(), *destBuffer, dmaOp.getDestIndices(),
-        dmaOp.getLayoutAttr(), dmaOp.getInBoundsAttr());
+        dmaOp.getLayoutAttr(), dmaOp.getPermutationMapAttr(),
+        dmaOp.getInBoundsAttr());
 
     replaceOpWithBufferizedValues(rewriter, dmaOp, *destBuffer);
     return success();
