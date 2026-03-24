@@ -362,6 +362,8 @@ struct ToLayoutOpVectorizationModel
     auto newLayoutOp = IREE::VectorExt::ToLayoutOp::create(
         rewriter, loc, readOp, toLayoutOp.getLayout(),
         toLayoutOp.getSharedMemoryConversion());
+    newLayoutOp->setDiscardableAttrs(
+        toLayoutOp->getDiscardableAttrDictionary());
     // Create the write back to a tensor.
     ShapedType tensorTy = toLayoutOp.getType();
     auto resType =
