@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.h"
+#include "iree/compiler/Codegen/Common/GPU/GPUPromotionAnalysis.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
@@ -31,25 +32,36 @@ using IREE::VectorExt::VectorLayoutInterface;
 
 namespace {
 
-static SmallVector<bool> getPromotedOperands(Operation *op) {
-  SmallVector<bool> promotedOperands(op->getNumOperands(), false);
+/// Per-operand promotion info. `std::nullopt` means not promoted. A set value
+/// holds the promotion type attribute (may be null for default/shared-memory
+/// promotion).
+using OperandPromotionList = SmallVector<std::optional<Attribute>>;
+
+static OperandPromotionList getOperandPromotions(Operation *op) {
+  OperandPromotionList result(op->getNumOperands(), std::nullopt);
 
   auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(op);
   if (!config) {
-    return promotedOperands;
+    return result;
   }
 
   std::optional<SmallVector<int64_t>> promoteConfig =
       getPromotedOperandList(config);
   if (!promoteConfig) {
-    return promotedOperands;
+    return result;
   }
 
-  for (int64_t operand : promoteConfig.value()) {
-    promotedOperands[operand] = true;
-  }
+  std::optional<ArrayRef<Attribute>> promotionTypes =
+      getPromotionTypesList(config);
 
-  return promotedOperands;
+  for (auto [idx, operand] : llvm::enumerate(promoteConfig.value())) {
+    Attribute type;
+    if (promotionTypes && idx < promotionTypes->size()) {
+      type = (*promotionTypes)[idx];
+    }
+    result[operand] = type;
+  }
+  return result;
 }
 
 static IREE::Codegen::InnerTileDescAttrInterface getIntrinsic(Operation *op) {
@@ -298,8 +310,8 @@ SmallVector<int64_t> getIterationSpaceBounds(linalg::LinalgOp linalgOp) {
 
 static LogicalResult
 setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
-                     SmallVector<bool> promotedOperands, RewriterBase &rewriter,
-                     linalg::LinalgOp contract) {
+                     const OperandPromotionList &operandPromotions,
+                     RewriterBase &rewriter, linalg::LinalgOp contract) {
   // This function should have only be called on a contraction op.
   assert(linalg::isaContractionOpInterface(contract) &&
          "cannot set contraction anchor on non contraction op");
@@ -324,20 +336,20 @@ setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
   auto layoutedRhs = ToLayoutOp::create(rewriter, loc, rhs, bLayout);
   auto layoutedAcc = ToLayoutOp::create(rewriter, loc, acc, cLayout);
 
-  // Promote matmul lhs and rhs.
-  // TODO: This is a hack until layout analysis is improved. The layout analysis
-  // should decide where to put these shared memory conversions.
-  if (promotedOperands[0]) {
-    layoutedLhs.setSharedMemoryConversion(true);
-  }
-
-  if (promotedOperands[1]) {
-    layoutedRhs.setSharedMemoryConversion(true);
-  }
-
-  if (promotedOperands[2]) {
-    layoutedAcc.setSharedMemoryConversion(true);
-  }
+  auto setPromotionOnLayout = [](ToLayoutOp toLayout,
+                                 std::optional<Attribute> promotion) {
+    if (!promotion) {
+      return;
+    }
+    if (isa_and_nonnull<IREE::GPU::UseGlobalLoadDMAAttr>(*promotion)) {
+      toLayout->setAttr(kPromotionTypeAttr, *promotion);
+      return;
+    }
+    toLayout.setSharedMemoryConversion(true);
+  };
+  setPromotionOnLayout(layoutedLhs, operandPromotions[0]);
+  setPromotionOnLayout(layoutedRhs, operandPromotions[1]);
+  setPromotionOnLayout(layoutedAcc, operandPromotions[2]);
 
   contract->setOperand(0, layoutedLhs.getResult());
   contract->setOperand(1, layoutedRhs.getResult());
@@ -441,11 +453,11 @@ static LogicalResult setIntrinsicLoweringConfigLayout(
     IREE::GPU::LoweringConfigAttr config, linalg::LinalgOp candidate,
     ArrayRef<int64_t> workgroupSize, RewriterBase &rewriter) {
 
-  SmallVector<bool> promotedOperands = getPromotedOperands(candidate);
+  OperandPromotionList operandPromotions = getOperandPromotions(candidate);
   IREE::Codegen::InnerTileDescAttrInterface intrinsic = getIntrinsic(candidate);
 
   if (linalg::isaContractionOpInterface(candidate)) {
-    if (succeeded(setContractionAnchor(intrinsic, promotedOperands, rewriter,
+    if (succeeded(setContractionAnchor(intrinsic, operandPromotions, rewriter,
                                        candidate))) {
       return success();
     }
@@ -499,7 +511,7 @@ static LogicalResult setGPULoweringConfigLayout(
       context, subgroupSizes, batchTile, outerTile, threadSizes,
       elementTile.value(), subgroupStrides, threadStrides);
 
-  SmallVector<bool> promotedOperands = getPromotedOperands(candidate);
+  OperandPromotionList operandPromotions = getOperandPromotions(candidate);
 
   rewriter.setInsertionPoint(candidate);
   for (OpOperand &operand : candidate->getOpOperands()) {
@@ -507,9 +519,15 @@ static LogicalResult setGPULoweringConfigLayout(
         layout.apply(candidate.getMatchingIndexingMap(&operand));
     auto toLayout =
         ToLayoutOp::create(rewriter, loc, operand.get(), operandLayout);
-    // Set shared memory promotion if requested.
-    toLayout.setSharedMemoryConversion(
-        promotedOperands[operand.getOperandNumber()]);
+    std::optional<Attribute> promotion =
+        operandPromotions[operand.getOperandNumber()];
+    if (promotion) {
+      if (isa_and_nonnull<IREE::GPU::UseGlobalLoadDMAAttr>(*promotion)) {
+        toLayout->setAttr(kPromotionTypeAttr, *promotion);
+      } else {
+        toLayout.setSharedMemoryConversion(true);
+      }
+    }
     operand.set(toLayout);
   }
 
@@ -576,6 +594,11 @@ struct LLVMGPUConfigureTensorLayoutsPass final
                 }
                 return setGPULoweringConfigLayout(config, candidate,
                                                   workgroupSize, rewriter);
+              })
+              .Case([&](IREE::GPU::UseGlobalLoadDMAAttr config) {
+                // No layout needed for DMA copies — they will be lowered
+                // to async_dma in GPUVectorAllocPass.
+                return success();
               })
               .Default(failure());
 
