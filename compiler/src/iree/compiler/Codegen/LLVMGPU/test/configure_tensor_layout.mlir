@@ -470,3 +470,61 @@ func.func @batch_matmul_block_intrinsic(%lhs: tensor<4x32x4xf16>,
 // CHECK: linalg.generic
 // CHECK-SAME: ins(%[[LHS]], %[[RHS]]
 // CHECK-SAME: outs(%[[ACC]]
+
+// -----
+
+#translation = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute>
+                                              workgroup_size = [64, 1, 1]
+                                              subgroup_size = 64>
+
+#maps = [
+  affine_map<(m, n, k) -> (m, k)>,
+  affine_map<(m, n, k) -> (n, k)>,
+  affine_map<(m, n, k) -> (m, n)>
+]
+
+#traits = {
+  indexing_maps = #maps,
+  iterator_types = ["parallel", "parallel", "reduction"],
+  lowering_config = #iree_gpu.lowering_config<{
+    mma_kind = #iree_gpu.mma_layout<MFMA_F32_32x32x8_F16>,
+    subgroup_basis = [[1, 1, 1], [0, 1, 2]],
+    promote_operands = [0, 1],
+    promotion_types = [#iree_gpu.use_global_load_dma, #iree_gpu.use_global_load_dma]
+  }>
+}
+
+func.func @matmul_dma_promotion(%lhs: tensor<96x16xf16>,
+                                %rhs: tensor<64x16xf16>,
+                                %init: tensor<96x64xf32>)
+                                -> tensor<96x64xf32>
+                                attributes { translation_info = #translation } {
+  %empty_lhs = tensor.empty() : tensor<96x16xf16>
+  %copy_lhs = linalg.copy
+              { lowering_config = #iree_gpu.use_global_load_dma }
+              ins(%lhs : tensor<96x16xf16>)
+              outs(%empty_lhs : tensor<96x16xf16>) -> tensor<96x16xf16>
+  %out = linalg.generic #traits
+                        ins(%copy_lhs, %rhs: tensor<96x16xf16>, tensor<64x16xf16>)
+                        outs(%init: tensor<96x64xf32>) {
+    ^bb0(%in: f16, %in_1: f16, %out: f32):
+      %ex   = arith.extf %in   : f16 to f32
+      %ex_1 = arith.extf %in_1 : f16 to f32
+      %mul  = arith.mulf %ex, %ex_1 : f32
+      %sum  = arith.addf %out, %mul : f32
+      linalg.yield %sum : f32
+  } -> tensor<96x64xf32>
+  return %out : tensor<96x64xf32>
+}
+
+// CHECK-LABEL: func.func @matmul_dma_promotion
+
+//       CHECK: %[[COPY:.+]] = linalg.copy
+//   CHECK-NOT:   iree_vector_ext.to_layout {{.*}} %[[COPY]]
+// CHECK-DAG: %[[LHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout({{.+}}) {iree_gpu.promotion_type = #iree_gpu.use_global_load_dma}
+// CHECK-DAG: %[[RHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout({{.+}}) {iree_gpu.promotion_type = #iree_gpu.use_global_load_dma}
+// CHECK-DAG: %[[ACC:.+]] = iree_vector_ext.to_layout %{{.*}} to layout({{.+}})
+// CHECK-NOT: shared_memory_conversion
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[LHS]], %[[RHS]]
+// CHECK-SAME: outs(%[[ACC]]
