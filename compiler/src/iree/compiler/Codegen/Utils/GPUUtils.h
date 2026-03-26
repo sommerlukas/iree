@@ -281,6 +281,20 @@ getXorShuffleAttr(MLIRContext *context, Attribute baseConfigAttr,
                   IREE::Codegen::InnerTileDescAttrInterface intrinsic,
                   ArrayRef<int64_t> reductionTileSizes, int operandIndex);
 //===----------------------------------------------------------------------===//
+// GPU DMA helpers
+//===----------------------------------------------------------------------===//
+
+/// Check if the target architecture supports global load DMA.
+/// Returns true only for CDNA4+ (gfx950+) architectures.
+bool targetSupportsGlobalLoadDMA(IREE::GPU::TargetAttr target);
+
+/// Returns the subgroup size if the available elements are aligned to DMA
+/// transfer sizes, std::nullopt otherwise.
+std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
+                                                 Type elementType,
+                                                 int64_t availableElements);
+
+//===----------------------------------------------------------------------===//
 // GPU CodeGen op filter
 //===----------------------------------------------------------------------===//
 
