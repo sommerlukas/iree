@@ -29,6 +29,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 #define DEBUG_TYPE "iree-codegen-gpu-utils"
@@ -1237,6 +1238,62 @@ bool hasSharedMemoryAddressSpace(MemRefType memrefType) {
 }
 
 //===----------------------------------------------------------------------===//
+// GPU DMA helpers
+//===----------------------------------------------------------------------===//
+
+bool targetSupportsGlobalLoadDMA(IREE::GPU::TargetAttr target) {
+  if (!target) {
+    return false;
+  }
+  FailureOr<amdgpu::Chipset> chipset = amdgpu::Chipset::parse(target.getArch());
+  if (failed(chipset)) {
+    return false;
+  }
+  // CDNA4 is gfx950+ (major=9, minor>=5). Other major versions (RDNA, etc.)
+  // do not support global load DMA.
+  return chipset->majorVersion == 9 && chipset->minorVersion >= 5;
+}
+
+std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
+                                                 Type elementType,
+                                                 int64_t availableElements) {
+  std::optional<int64_t> subgroupSize = getSubgroupSize(funcOp);
+  if (!subgroupSize) {
+    return std::nullopt;
+  }
+
+  int64_t elementBits = elementType.getIntOrFloatBitWidth();
+
+  IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp);
+  if (!target || !targetSupportsGlobalLoadDMA(target)) {
+    return std::nullopt;
+  }
+
+  ArrayRef<int64_t> dmaSizes;
+  if (auto dmaSizesAttr = target.getWgp().getDmaSizes()) {
+    dmaSizes = dmaSizesAttr.asArrayRef();
+  }
+
+  int64_t minElementsPerTransfer = std::numeric_limits<int64_t>::max();
+  for (int64_t dmaSize : dmaSizes) {
+    if (dmaSize % elementBits != 0) {
+      continue;
+    }
+    int64_t elementsPerLane = dmaSize / elementBits;
+    int64_t elementsPerTransfer = *subgroupSize * elementsPerLane;
+    minElementsPerTransfer =
+        std::min(minElementsPerTransfer, elementsPerTransfer);
+  }
+
+  if (minElementsPerTransfer == std::numeric_limits<int64_t>::max() ||
+      availableElements % minElementsPerTransfer != 0) {
+    return std::nullopt;
+  }
+
+  return subgroupSize;
+}
+
+//===----------------------------------------------------------------------===//
 // GPU CodeGen op filter
 //===----------------------------------------------------------------------===//
 
@@ -1305,17 +1362,6 @@ IREE::GPU::TargetAttr getGPUTargetAttr(MLIRContext *context,
 IREE::GPU::TargetAttr getGPUTargetAttr(Operation *op) {
   return getGPUTargetAttr(op->getContext(),
                           IREE::HAL::ExecutableTargetAttr::lookup(op));
-}
-
-bool targetSupportsGlobalLoadDMA(IREE::GPU::TargetAttr target) {
-  if (!target) {
-    return false;
-  }
-  FailureOr<amdgpu::Chipset> chipset = amdgpu::Chipset::parse(target.getArch());
-  if (failed(chipset)) {
-    return false;
-  }
-  return chipset->majorVersion == 9 && chipset->minorVersion >= 5;
 }
 
 void addConfigGPUTarget(MLIRContext *context,
