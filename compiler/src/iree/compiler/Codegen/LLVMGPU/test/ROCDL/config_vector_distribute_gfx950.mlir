@@ -2,6 +2,11 @@
 // RUN: --iree-codegen-llvmgpu-use-vector-distribution \
 // RUN:   --iree-codegen-llvmgpu-use-unaligned-gemm-vector-distribution --iree-codegen-llvmgpu-use-igemm=false \
 // RUN:   --pass-pipeline="builtin.module(iree-llvmgpu-select-lowering-strategy)" %s | FileCheck %s
+// RUN: iree-opt --split-input-file --iree-gpu-test-target=gfx950 --iree-codegen-llvmgpu-use-tile-and-fuse-matmul=false \
+// RUN: --iree-codegen-llvmgpu-use-vector-distribution \
+// RUN:   --iree-codegen-llvmgpu-use-unaligned-gemm-vector-distribution --iree-codegen-llvmgpu-use-igemm=false \
+// RUN:   --iree-llvmgpu-use-direct-load=true \
+// RUN:   --pass-pipeline="builtin.module(iree-llvmgpu-select-lowering-strategy)" %s | FileCheck %s --check-prefixes=CHECK,DIRECT-LOAD
 
 // TODO: This test is still using the legacy LLVMGPU kernel config. This needs
 // to be migrated to the rocdl heuristics, but for now is just physically
@@ -193,6 +198,7 @@ func.func @matmul_dynamic_dim() {
 
 // CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute>
 // CHECK-NOT:   prefetch_num_stages = 2
+// DIRECT-LOAD: no_reduce_shared_memory_bank_conflicts = true
 
 // CHECK-LABEL: func.func @attention_20x4096x64x4096x64()
 
@@ -237,9 +243,12 @@ func.func @attention_20x4096x64x4096x64() {
 }
 
 // CHECK:      MFMA_F32_16x16x16_F16
+// DIRECT-LOAD-SAME: promotion_types = [#iree_gpu.use_global_load_dma]
 // CHECK-SAME{LITERAL}: subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 3, 4]]
 // CHECK-SAME: MFMA_F32_16x16x32_F16
+// DIRECT-LOAD-SAME: promotion_types = [#iree_gpu.use_global_load_dma, #iree_gpu.use_global_load_dma]
 // CHECK-SAME{LITERAL}: subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]
+// DIRECT-LOAD-SAME: promotion_types = [#iree_gpu.use_global_load_dma, #iree_gpu.use_global_load_dma, #iree_gpu.use_global_load_dma]
 // CHECK-SAME: reduction =  [0, 0, 0, 64, 0]
 // CHECK-SAME: workgroup =  [1, 64, 0, 0, 64]
 
