@@ -141,10 +141,10 @@ static LogicalResult materializeDMAPromotions(
     if (eligible) {
       VectorType vectorType = readOp.getVectorType();
 
-      // Total transfer size must be aligned to the minimum DMA transfer size.
+      // Total transfer size must be aligned to the minimum DMA transfer size
+      // for the full workgroup (all subgroups must participate).
+      // TODO: Check if participation of only some subgroups makes sense.
       int64_t totalElements = vectorType.getNumElements();
-      // TODO: Also check that the number of transfers is evenly distributable
-      // across subgroups, or handle partial subgroup participation in lowering.
       if (!getDMAAlignedSubgroupSize(funcOp, vectorType.getElementType(),
                                      totalElements)
                .has_value()) {
@@ -174,7 +174,7 @@ static LogicalResult materializeDMAPromotions(
       continue;
     }
 
-    // DMA path: alloc_tensor → async_dma → value_barrier → transfer_read.
+    // DMA path: alloc_tensor -> async_dma -> value_barrier -> transfer_read.
     // Insert before the original transfer_read (replacing it).
     builder.setInsertionPoint(readOp);
     auto layout = layouts.lookup(readOp.getResult());

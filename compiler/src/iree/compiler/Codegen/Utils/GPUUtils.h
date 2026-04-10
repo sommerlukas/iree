@@ -289,7 +289,7 @@ getXorShuffleAttr(MLIRContext *context, Attribute baseConfigAttr,
 bool targetSupportsGlobalLoadDMA(IREE::GPU::TargetAttr target);
 
 /// Returns the subgroup size if the available elements are aligned to DMA
-/// transfer sizes, std::nullopt otherwise.
+/// transfer sizes for the full workgroup, std::nullopt otherwise.
 std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
                                                  Type elementType,
                                                  int64_t availableElements);
