@@ -35,7 +35,7 @@ func.func @test(%vector: vector<16x16xf16>) -> vector<16x16xf16> {
   dma_sizes = [32, 128]
 >>
 #exec_target_elem = #hal.executable.target<"rocm", "rocm-hsaco-fb", {iree_codegen.target_info = #gpu_target_elem}>
-#translation_elem = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 64>
+#translation_elem = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute> workgroup_size = [64, 1, 1] subgroup_size = 64>
 
 #layout_dma_elem = #iree_vector_ext.nested_layout<
   subgroup_tile = [1, 1],
@@ -112,4 +112,55 @@ func.func @async_dma_fallback(%src: tensor<16x16xf16>, %i: index, %j: index)
 //      CHECK:    %[[READ2:.+]] = vector.transfer_read %[[BAR]]
 //      CHECK:    %[[OUT:.+]] = iree_vector_ext.to_layout %[[READ2]]
 // CHECK-NOT:     iree_gpu.promotion_type
+//      CHECK:    return %[[OUT]]
+
+// -----
+
+// Test: Fallback when transfer is too small for all subgroups.
+// Minimum DMA transfer per workgroup = 256 * (32/16) = 512 elements, but
+// tensor has only 256 elements.
+
+#gpu_target_small = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32, storage = b32, subgroup = shuffle,
+  max_load_instruction_bits = 128, subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024], max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536, max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128]
+>>
+#exec_target_small = #hal.executable.target<"rocm", "rocm-hsaco-fb", {iree_codegen.target_info = #gpu_target_small}>
+#translation_small = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute> workgroup_size = [256, 1, 1] subgroup_size = 64>
+
+#layout_small = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1, 1],
+  batch_tile = [1, 1, 1],
+  outer_tile = [1, 1, 1],
+  thread_tile = [1, 4, 16],
+  element_tile = [1, 4, 1],
+
+  subgroup_strides = [0, 0, 0],
+  thread_strides   = [0, 16, 1]
+>
+
+func.func @async_dma_too_small_for_subgroups(
+    %src: tensor<1x16x16xf16>, %i: index, %j: index, %k: index)
+    -> vector<1x16x16xf16>
+    attributes {hal.executable.target = #exec_target_small, translation_info = #translation_small} {
+  %cst = arith.constant 0.0 : f16
+  %read = vector.transfer_read %src[%i, %j, %k], %cst {in_bounds = [true, true, true]}
+      : tensor<1x16x16xf16>, vector<1x16x16xf16>
+  %out = iree_vector_ext.to_layout %read to layout(#layout_small)
+      {iree_gpu.promotion_type = #iree_gpu.use_global_load_dma} : vector<1x16x16xf16>
+  return %out : vector<1x16x16xf16>
+}
+
+// CHECK-LABEL: func.func @async_dma_too_small_for_subgroups
+// CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: tensor<1x16x16xf16>
+//      CHECK:    gpu.barrier
+//  CHECK-NOT:    iree_gpu.async_dma
+//      CHECK:    %[[READ:.+]] = vector.transfer_read %[[SRC]]
+//      CHECK:    %[[ALLOC:.+]] = bufferization.alloc_tensor() {{.*}} #gpu.address_space<workgroup>
+//      CHECK:    %[[WRITE:.+]] = vector.transfer_write %[[READ]], %[[ALLOC]]
+//      CHECK:    %[[BAR:.+]] = iree_gpu.value_barrier %[[WRITE]]
+//      CHECK:    %[[READ2:.+]] = vector.transfer_read %[[BAR]]
+//      CHECK:    %[[OUT:.+]] = iree_vector_ext.to_layout %[[READ2]]
 //      CHECK:    return %[[OUT]]

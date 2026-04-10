@@ -1262,6 +1262,13 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
     return std::nullopt;
   }
 
+  std::optional<SmallVector<int64_t>> maybeWorkgroupSize =
+      getWorkgroupSize(funcOp);
+  if (!maybeWorkgroupSize) {
+    return std::nullopt;
+  }
+  int64_t numThreads = llvm::product_of(*maybeWorkgroupSize);
+
   int64_t elementBits = elementType.getIntOrFloatBitWidth();
 
   IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp);
@@ -1274,19 +1281,22 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
     dmaSizes = dmaSizesAttr.asArrayRef();
   }
 
-  int64_t minElementsPerTransfer = std::numeric_limits<int64_t>::max();
+  // Check alignment against all threads, not just one subgroup. DMA lowering
+  // requires all subgroups to participate, so the transfer must be large enough
+  // to distribute across numThreads * elementsPerLane elements.
+  int64_t minElementsPerWorkgroup = std::numeric_limits<int64_t>::max();
   for (int64_t dmaSize : dmaSizes) {
     if (dmaSize % elementBits != 0) {
       continue;
     }
     int64_t elementsPerLane = dmaSize / elementBits;
-    int64_t elementsPerTransfer = *subgroupSize * elementsPerLane;
-    minElementsPerTransfer =
-        std::min(minElementsPerTransfer, elementsPerTransfer);
+    int64_t elementsPerWorkgroup = numThreads * elementsPerLane;
+    minElementsPerWorkgroup =
+        std::min(minElementsPerWorkgroup, elementsPerWorkgroup);
   }
 
-  if (minElementsPerTransfer == std::numeric_limits<int64_t>::max() ||
-      availableElements % minElementsPerTransfer != 0) {
+  if (minElementsPerWorkgroup == std::numeric_limits<int64_t>::max() ||
+      availableElements % minElementsPerWorkgroup != 0) {
     return std::nullopt;
   }
 
