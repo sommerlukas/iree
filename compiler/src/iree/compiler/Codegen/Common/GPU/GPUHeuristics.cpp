@@ -1092,7 +1092,8 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     ArrayRef<GPUIntrinsicType> intrinsics,
     const GPUMMAHeuristicSeeds &pvMatmulSeeds, int64_t sharedMemLimitInBytes,
     int64_t subgroupSize, bool transposedQ, bool transposedK, bool transposedV,
-    bool canUpcastAcc, bool mustBeAligned) {
+    bool canUpcastAcc, bool mustBeAligned, bool useDirectLoad,
+    int64_t prefetchNumStages) {
   SmallVector<uint64_t> qkViableIntrinsicIndices;
   SmallVector<uint64_t> pvViableIntrinsicIndices;
   for (const auto &[index, intrinsic] : llvm::enumerate(intrinsics)) {
@@ -1198,10 +1199,15 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
       int64_t lhsBBitwidth =
           canReuseAOutput ? 0 : intrinsicB.aType.getIntOrFloatBitWidth();
 
-      int64_t sharedMemoryUsed = calculateOperandsSharedMemoryUsedInBytes(
-                                     qkSchedule, lhsABitwidth, rhsABitwidth) +
-                                 calculateOperandsSharedMemoryUsedInBytes(
-                                     schedule, lhsBBitwidth, rhsBBitwidth);
+      int64_t sharedMemoryUsed =
+          calculateOperandsSharedMemoryUsedInBytes(
+              qkSchedule, lhsABitwidth, rhsABitwidth,
+              /*lhsScaleBitwidth=*/0, /*rhsScaleBitwidth=*/0, /*numRhs=*/1,
+              useDirectLoad, prefetchNumStages) +
+          calculateOperandsSharedMemoryUsedInBytes(
+              schedule, lhsBBitwidth, rhsBBitwidth,
+              /*lhsScaleBitwidth=*/0, /*rhsScaleBitwidth=*/0, /*numRhs=*/1,
+              useDirectLoad, prefetchNumStages);
 
       LDBG() << "Available Shared Memory: " << sharedMemLimitInBytes << " bytes"
              << "Predicted Shared Memory Used by Schedule: " << sharedMemoryUsed

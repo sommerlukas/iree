@@ -742,7 +742,9 @@ setAttentionPipelineAttributes(IREE::GPU::TargetAttr target,
 
 static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
-    IREE::LinalgExt::AttentionOp op) {
+    IREE::LinalgExt::AttentionOp op, bool useDirectLoad) {
+  // Don't use direct-to-LDS if the target doesn't support it.
+  useDirectLoad &= targetSupportsGlobalLoadDMA(target);
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -890,16 +892,20 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
   // First try to find a schedule with an exactly matching intrinsic.
+  // TODO: Pass prefetchNumStages once attention supports prefetching.
   std::optional<std::pair<GPUMMASchedule, GPUMMASchedule>> attSchedule =
-      deduceAttentionSchedule(qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds,
-                              maxSharedMemoryBytes, targetSubgroupSize,
-                              transposedQ, transposedK, transposedV);
+      deduceAttentionSchedule(
+          qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds, maxSharedMemoryBytes,
+          targetSubgroupSize, transposedQ, transposedK, transposedV,
+          /*canUpcastAcc=*/false, /*mustBeAligned=*/true, useDirectLoad,
+          /*prefetchNumStages=*/0);
   if (!attSchedule) {
     // Then try again by allowing upcasting accumulator.
     attSchedule = deduceAttentionSchedule(
         qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds, maxSharedMemoryBytes,
         targetSubgroupSize, transposedQ, transposedK, transposedV,
-        /*canUpcastAcc=*/true);
+        /*canUpcastAcc=*/true, /*mustBeAligned=*/true, useDirectLoad,
+        /*prefetchNumStages=*/0);
   }
 
   if (!attSchedule) {
@@ -974,7 +980,13 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   SmallVector<NamedAttribute, 2> attrs = {
       NamedAttribute("workgroup", b.getI64ArrayAttr(workgroupTileSizes)),
       NamedAttribute("reduction", b.getI64ArrayAttr(reductionTileSizes))};
-  IREE::GPU::appendPromotedOperandsList(context, attrs, {0, 1, 2});
+  SmallVector<Attribute> promotionArray;
+  if (useDirectLoad) {
+    Attribute useGlobalDma = IREE::GPU::UseGlobalLoadDMAAttr::get(context);
+    promotionArray.append(3, useGlobalDma);
+  }
+  IREE::GPU::appendPromotedOperandsList(context, attrs, {0, 1, 2},
+                                        promotionArray);
 
   // Check if transposing both intrinsics eliminates the layout conflict
   // between QK output and PV LHS input.
@@ -1011,14 +1023,26 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   SmallVector<NamedAttribute, 2> pvConfig;
 
   // Configuring for qk matmul.
-  IREE::GPU::appendPromotedOperandsList(context, qkConfig, {0, 1});
+  SmallVector<Attribute> qkPromotionArray;
+  if (useDirectLoad) {
+    Attribute useGlobalDma = IREE::GPU::UseGlobalLoadDMAAttr::get(context);
+    qkPromotionArray.append(2, useGlobalDma);
+  }
+  IREE::GPU::appendPromotedOperandsList(context, qkConfig, {0, 1},
+                                        qkPromotionArray);
   IREE::GPU::setMmaKind(context, qkConfig,
                         getIntrinsic(qkSchedule.mmaKind, useColMajor));
   IREE::GPU::setBasis(context, qkConfig, IREE::GPU::TilingLevel::Subgroup,
                       projectBasis(subgroupBasis, opInfo.getNDims()));
 
   // Configuring for pv matmul.
-  IREE::GPU::appendPromotedOperandsList(context, pvConfig, {1});
+  SmallVector<Attribute> pvPromotionArray;
+  if (useDirectLoad) {
+    Attribute useGlobalDma = IREE::GPU::UseGlobalLoadDMAAttr::get(context);
+    pvPromotionArray.push_back(useGlobalDma);
+  }
+  IREE::GPU::appendPromotedOperandsList(context, pvConfig, {1},
+                                        pvPromotionArray);
   IREE::GPU::setMmaKind(context, pvConfig,
                         getIntrinsic(pvSchedule.mmaKind, useColMajor));
   IREE::GPU::setBasis(context, pvConfig, IREE::GPU::TilingLevel::Subgroup,
@@ -1056,6 +1080,16 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   SmallVector<NamedAttribute, 1> pipelineAttrs;
 
   setAttentionPipelineAttributes(target, pipelineAttrs);
+
+  if (useDirectLoad) {
+    auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
+        context, /*prefetchNumStages=*/0,
+        /*no_reduce_shared_memory_bank_conflicts=*/true,
+        /*use_igemm_convolution=*/false,
+        /*reorder_workgroups_strategy=*/std::nullopt);
+    pipelineAttrs.emplace_back(
+        IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
+  }
 
   // TODO: We do not turn prefetching on even when requested by the prefetching
   // flag because there is a shared memory allocation the two matmuls, which
@@ -1418,7 +1452,7 @@ setAttentionVectorDistributionConfig(IREE::GPU::TargetAttr target,
 static LogicalResult
 setVectorDistributionConfig(IREE::GPU::TargetAttr target,
                             mlir::FunctionOpInterface entryPoint,
-                            Operation *computeOp) {
+                            Operation *computeOp, bool useDirectLoad) {
   if (!clGPUEnableVectorDistribution) {
     LDBG() << "Vector Distribution not enabled, skipping...";
     return failure();
@@ -1444,7 +1478,7 @@ setVectorDistributionConfig(IREE::GPU::TargetAttr target,
   if (auto attnOp = dyn_cast<IREE::LinalgExt::AttentionOp>(computeOp)) {
     LDBG() << "VectorDistribution: trying to find a suitable attention config";
     if (succeeded(setAttentionIntrinsicBasedVectorDistributionConfig(
-            target, entryPoint, attnOp))) {
+            target, entryPoint, attnOp, useDirectLoad))) {
       return success();
     }
     return setAttentionVectorDistributionConfig(target, entryPoint, attnOp);
@@ -2415,7 +2449,8 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
       return success();
     }
   }
-  if (succeeded(setVectorDistributionConfig(target, entryPointFn, computeOp))) {
+  if (succeeded(setVectorDistributionConfig(target, entryPointFn, computeOp,
+                                            clUseDirectLoad))) {
     return success();
   }
 
