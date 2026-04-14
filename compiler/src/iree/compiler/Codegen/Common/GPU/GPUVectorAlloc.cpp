@@ -199,12 +199,13 @@ static LogicalResult materializeDMAPromotions(
       int64_t totalElements = vectorType.getNumElements();
       int64_t elementBitWidth =
           vectorType.getElementType().getIntOrFloatBitWidth();
-      // The compute layout's element tile determines the contiguous access
-      // width per thread during MMA reads. accessElems must divide this so
-      // ResolveSwizzleHints can correctly unroll the distributed loads.
+      // The innermost element tile dimension determines the contiguous access
+      // width per thread during MMA reads from the flat LDS buffer.
+      // accessElems must divide this so ResolveSwizzleHints can correctly
+      // unroll the distributed loads.
       auto nestedLayout = dyn_cast<IREE::VectorExt::NestedLayoutAttr>(layout);
       int64_t computeAccessWidth =
-          nestedLayout ? llvm::product_of(nestedLayout.getElementTile()) : 1;
+          nestedLayout ? nestedLayout.getElementTile().back() : 1;
       auto swizzleParams = getXorShuffleParamsForDMA(
           target, elementBitWidth, totalElements, computeAccessWidth);
       if (succeeded(swizzleParams)) {

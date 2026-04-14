@@ -204,14 +204,16 @@ func.func @async_dma_swizzled(
   return %out : vector<4x64xf16>
 }
 
+// The element tile is [4, 1] — the innermost (contiguous) dimension is 1, so
+// no valid swizzle can be applied. The DMA should proceed without a hint.
 // CHECK-LABEL: func.func @async_dma_swizzled
 // CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: tensor<4x64xf16>
 // CHECK-SAME:    %[[I:[a-zA-Z0-9]+]]: index
 // CHECK-SAME:    %[[J:[a-zA-Z0-9]+]]: index
 //      CHECK:    gpu.barrier
 //      CHECK:    %[[ALLOC:.+]] = bufferization.alloc_tensor() {{.*}} : tensor<4x64xf16, #gpu.address_space<workgroup>>
-//      CHECK:    %[[HINT:.+]] = iree_codegen.swizzle_hint %[[ALLOC]][#iree_codegen.xor_shuffle<64, 4>]
-//      CHECK:    %[[DMA:.+]] = iree_gpu.async_dma %[[SRC]][%[[I]], %[[J]]] to %[[HINT]]
+//  CHECK-NOT:    iree_codegen.swizzle_hint
+//      CHECK:    %[[DMA:.+]] = iree_gpu.async_dma %[[SRC]][%[[I]], %[[J]]] to %[[ALLOC]]
 //      CHECK:    %[[BARRIER:.+]] = iree_gpu.value_barrier %[[DMA]]
 //      CHECK:    %[[READ:.+]] = vector.transfer_read %[[BARRIER]]{{.*}} : {{.*}}, vector<4x64xf16>
 //  CHECK-NOT:    vector.shape_cast
@@ -229,3 +231,56 @@ func.func @async_dma_swizzled(
 //      NOSWIZZLE:    %[[READ:.+]] = vector.transfer_read %[[BARRIER]]{{.*}} : {{.*}}, vector<4x64xf16>
 //  NOSWIZZLE-NOT:    vector.shape_cast
 //      NOSWIZZLE:    return
+
+// -----
+
+// Test: async_dma with swizzle — element tile has contiguous innermost dim.
+
+#gpu_target_swizzle2 = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32, storage = b32, subgroup = shuffle,
+  max_load_instruction_bits = 128, subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024], max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536, max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128],
+  workgroup_memory_bank_count = 32
+>>
+#exec_target_swizzle2 = #hal.executable.target<"rocm", "rocm-hsaco-fb", {iree_codegen.target_info = #gpu_target_swizzle2}>
+#translation_swizzle2 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute> workgroup_size = [64, 1, 1] subgroup_size = 64>
+
+#layout_dma_swizzle2 = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1],
+  batch_tile = [1, 1],
+  outer_tile = [1, 1],
+  thread_tile = [4, 16],
+  element_tile = [1, 8],
+
+  subgroup_strides = [0, 0],
+  thread_strides   = [16, 1]
+>
+
+func.func @async_dma_swizzled_contiguous(
+    %src: tensor<4x128xf16>, %i: index, %j: index)
+    -> vector<4x128xf16>
+    attributes {hal.executable.target = #exec_target_swizzle2, translation_info = #translation_swizzle2} {
+  %cst = arith.constant 0.0 : f16
+  %read = vector.transfer_read %src[%i, %j], %cst {in_bounds = [true, true]}
+      : tensor<4x128xf16>, vector<4x128xf16>
+  %out = iree_vector_ext.to_layout %read to layout(#layout_dma_swizzle2)
+      {iree_gpu.promotion_type = #iree_gpu.use_global_load_dma} : vector<4x128xf16>
+  return %out : vector<4x128xf16>
+}
+
+// The element tile is [1, 8] — innermost contiguous dim is 8, so swizzle
+// should be applied.
+// CHECK-LABEL: func.func @async_dma_swizzled_contiguous
+// CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: tensor<4x128xf16>
+// CHECK-SAME:    %[[I:[a-zA-Z0-9]+]]: index
+// CHECK-SAME:    %[[J:[a-zA-Z0-9]+]]: index
+//      CHECK:    gpu.barrier
+//      CHECK:    %[[ALLOC:.+]] = bufferization.alloc_tensor() {{.*}} : tensor<4x128xf16, #gpu.address_space<workgroup>>
+//      CHECK:    %[[HINT:.+]] = iree_codegen.swizzle_hint %[[ALLOC]][#iree_codegen.xor_shuffle<64, 8>]
+//      CHECK:    %[[DMA:.+]] = iree_gpu.async_dma %[[SRC]][%[[I]], %[[J]]] to %[[HINT]]
+//      CHECK:    %[[BARRIER:.+]] = iree_gpu.value_barrier %[[DMA]]
+//      CHECK:    %[[READ:.+]] = vector.transfer_read %[[BARRIER]]{{.*}} : {{.*}}, vector<4x128xf16>
+//      CHECK:    %[[OUT:.+]] = iree_vector_ext.to_layout %[[READ]]
+//      CHECK:    return %[[OUT]]
