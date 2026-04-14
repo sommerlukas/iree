@@ -1,4 +1,5 @@
 // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-vector-alloc))" | FileCheck %s
+// RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-vector-alloc))" --iree-codegen-enable-dma-swizzle=false | FileCheck %s --check-prefix=NOSWIZZLE
 
 #layout = #iree_vector_ext.nested_layout<
   subgroup_tile = [1, 1],
@@ -164,3 +165,67 @@ func.func @async_dma_too_small_for_subgroups(
 //      CHECK:    %[[READ2:.+]] = vector.transfer_read %[[BAR]]
 //      CHECK:    %[[OUT:.+]] = iree_vector_ext.to_layout %[[READ2]]
 //      CHECK:    return %[[OUT]]
+
+// -----
+
+// Test: async_dma with swizzle.
+
+#gpu_target_swizzle = #iree_gpu.target<arch = "gfx950", features = "", wgp = <
+  compute = fp32, storage = b32, subgroup = shuffle,
+  max_load_instruction_bits = 128, subgroup_size_choices = [64],
+  max_workgroup_sizes = [1024, 1024, 1024], max_thread_count_per_workgroup = 1024,
+  max_workgroup_memory_bytes = 65536, max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+  dma_sizes = [32, 128],
+  workgroup_memory_bank_count = 32
+>>
+#exec_target_swizzle = #hal.executable.target<"rocm", "rocm-hsaco-fb", {iree_codegen.target_info = #gpu_target_swizzle}>
+#translation_swizzle = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute> workgroup_size = [64, 1, 1] subgroup_size = 64>
+
+#layout_dma_swizzle = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1],
+  batch_tile = [1, 1],
+  outer_tile = [1, 1],
+  thread_tile = [1, 64],
+  element_tile = [4, 1],
+
+  subgroup_strides = [0, 0],
+  thread_strides   = [0, 1]
+>
+
+func.func @async_dma_swizzled(
+    %src: tensor<4x64xf16>, %i: index, %j: index)
+    -> vector<4x64xf16>
+    attributes {hal.executable.target = #exec_target_swizzle, translation_info = #translation_swizzle} {
+  %cst = arith.constant 0.0 : f16
+  %read = vector.transfer_read %src[%i, %j], %cst {in_bounds = [true, true]}
+      : tensor<4x64xf16>, vector<4x64xf16>
+  %out = iree_vector_ext.to_layout %read to layout(#layout_dma_swizzle)
+      {iree_gpu.promotion_type = #iree_gpu.use_global_load_dma} : vector<4x64xf16>
+  return %out : vector<4x64xf16>
+}
+
+// CHECK-LABEL: func.func @async_dma_swizzled
+// CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: tensor<4x64xf16>
+// CHECK-SAME:    %[[I:[a-zA-Z0-9]+]]: index
+// CHECK-SAME:    %[[J:[a-zA-Z0-9]+]]: index
+//      CHECK:    gpu.barrier
+//      CHECK:    %[[ALLOC:.+]] = bufferization.alloc_tensor() {{.*}} : tensor<4x64xf16, #gpu.address_space<workgroup>>
+//      CHECK:    %[[HINT:.+]] = iree_codegen.swizzle_hint %[[ALLOC]][#iree_codegen.xor_shuffle<64, 4>]
+//      CHECK:    %[[DMA:.+]] = iree_gpu.async_dma %[[SRC]][%[[I]], %[[J]]] to %[[HINT]]
+//      CHECK:    %[[BARRIER:.+]] = iree_gpu.value_barrier %[[DMA]]
+//      CHECK:    %[[READ:.+]] = vector.transfer_read %[[BARRIER]]{{.*}} : {{.*}}, vector<4x64xf16>
+//  CHECK-NOT:    vector.shape_cast
+//      CHECK:    %[[OUT:.+]] = iree_vector_ext.to_layout %[[READ]]
+//      CHECK:    return %[[OUT]]
+
+// When swizzle is disabled, fall back to non-swizzled 2D DMA.
+// NOSWIZZLE-LABEL: func.func @async_dma_swizzled
+// NOSWIZZLE-SAME:    %[[SRC:[a-zA-Z0-9]+]]: tensor<4x64xf16>
+//      NOSWIZZLE:    gpu.barrier
+//      NOSWIZZLE:    %[[ALLOC:.+]] = bufferization.alloc_tensor() {{.*}} : tensor<4x64xf16, #gpu.address_space<workgroup>>
+//  NOSWIZZLE-NOT:    iree_codegen.swizzle_hint
+//      NOSWIZZLE:    %[[DMA:.+]] = iree_gpu.async_dma %[[SRC]]{{.*}} to %[[ALLOC]]
+//      NOSWIZZLE:    %[[BARRIER:.+]] = iree_gpu.value_barrier %[[DMA]]
+//      NOSWIZZLE:    %[[READ:.+]] = vector.transfer_read %[[BARRIER]]{{.*}} : {{.*}}, vector<4x64xf16>
+//  NOSWIZZLE-NOT:    vector.shape_cast
+//      NOSWIZZLE:    return

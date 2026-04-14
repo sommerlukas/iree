@@ -191,6 +191,11 @@ static void resolveHintOp(RewriterBase &rewriter,
     if (isa<amdgpu::GatherToLDSOp, ViewLikeOpInterface>(user)) {
       continue;
     }
+    // View-like ops (e.g., expand_shape from FlattenSwizzleHintAllocsPass) are
+    // not memory accesses themselves, so they can be ignored.
+    if (isa<ViewLikeOpInterface>(user)) {
+      continue;
+    }
     // Throw if we can't rewrite all users.
     hintOp.emitError() << "unsupported SwizzleHintOp user: " << user;
     return;

@@ -454,6 +454,7 @@ def GPUVectorAllocPass :
     "::mlir::gpu::GPUDialect",
     "::mlir::vector::VectorDialect",
     "::mlir::bufferization::BufferizationDialect",
+    "::mlir::iree_compiler::IREE::Codegen::IREECodegenDialect",
     "::mlir::iree_compiler::IREE::GPU::IREEGPUDialect",
   ];
 }

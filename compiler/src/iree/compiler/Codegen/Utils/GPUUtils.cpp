@@ -1303,6 +1303,70 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
   return subgroupSize;
 }
 
+// Derives XOR swizzle parameters for DMA-promoted LDS allocations.
+//
+// The two return values are:
+//
+//   rowElems    -- number of elements spanning all LDS banks in one row.
+//                  Computed as bankCount * bankWidthBytes / elementBytes.
+//
+//   accessElems -- contiguous-element granularity of the XOR permutation.
+//                  Set to computeAccessWidth: the number of contiguous elements
+//                  each thread reads from LDS during the compute phase (product
+//                  of the compute layout's element tile).
+//
+// Using the compute access width as the swizzle granularity satisfies two
+// constraints:
+//
+//   Read side:  ResolveSwizzleHints unrolls distributed vector.load ops in
+//               accessElems-sized chunks. The load width equals
+//               computeAccessWidth, so the divisibility is exact.
+//
+//   Write side: Each gather_to_lds transfers elementsPerDMA contiguous source
+//               elements to a contiguous dest range. For the XOR swizzle to
+//               map these to contiguous source elements, the dest range must
+//               fall within a single swizzle block, i.e.
+//               computeAccessWidth % elementsPerDMA == 0. We verify that at
+//               least one available DMA size satisfies this, so that
+//               GPULowerAsyncDMA can find a valid DMA layout.
+//
+// The result is validated via isXORShuffleValid, which checks that rowElems
+// and accessElems divide totalElements and each other appropriately.
+FailureOr<XorShuffleParams>
+getXorShuffleParamsForDMA(IREE::GPU::TargetAttr target, int64_t elementBitWidth,
+                          int64_t totalElements, int64_t computeAccessWidth) {
+  IREE::GPU::TargetWgpAttr wgp = target.getWgp();
+  std::optional<int64_t> bankCount = wgp.getWorkgroupMemoryBankCount();
+  if (!bankCount.has_value()) {
+    return failure();
+  }
+
+  constexpr int64_t bankWidthBits = 32;
+  int64_t rowElems = (*bankCount * bankWidthBits) / elementBitWidth;
+
+  if (!isXORShuffleValid(rowElems, computeAccessWidth, totalElements)) {
+    return failure();
+  }
+
+  // Verify that at least one DMA size produces an elementsPerDMA that divides
+  // computeAccessWidth. This ensures gather_to_lds writes stay within a
+  // single swizzle block, so the XOR permutation maps contiguous dest
+  // elements to contiguous source elements.
+  ArrayRef<int64_t> dmaSizes;
+  if (auto dmaSizesAttr = wgp.getDmaSizes()) {
+    dmaSizes = dmaSizesAttr.asArrayRef();
+  }
+  bool hasCompatibleDMASize = llvm::any_of(dmaSizes, [&](int64_t dmaSize) {
+    return dmaSize % elementBitWidth == 0 &&
+           computeAccessWidth % (dmaSize / elementBitWidth) == 0;
+  });
+  if (!hasCompatibleDMASize) {
+    return failure();
+  }
+
+  return XorShuffleParams{rowElems, computeAccessWidth};
+}
+
 //===----------------------------------------------------------------------===//
 // GPU CodeGen op filter
 //===----------------------------------------------------------------------===//

@@ -294,6 +294,11 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
                                                  Type elementType,
                                                  int64_t availableElements);
 
+/// Derives XOR swizzle parameters for DMA-promoted LDS allocations.
+FailureOr<XorShuffleParams>
+getXorShuffleParamsForDMA(IREE::GPU::TargetAttr target, int64_t elementBitWidth,
+                          int64_t totalElements, int64_t computeAccessWidth);
+
 //===----------------------------------------------------------------------===//
 // GPU CodeGen op filter
 //===----------------------------------------------------------------------===//

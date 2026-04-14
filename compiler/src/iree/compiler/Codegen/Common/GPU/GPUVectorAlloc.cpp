@@ -8,12 +8,15 @@
 #include "iree/compiler/Codegen/Common/GPU/GPUPromotionAnalysis.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -32,6 +35,11 @@ namespace mlir::iree_compiler {
 
 #define GEN_PASS_DEF_GPUVECTORALLOCPASS
 #include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
+
+static llvm::cl::opt<bool> clEnableDMASwizzle(
+    "iree-codegen-enable-dma-swizzle",
+    llvm::cl::desc("Enable XOR swizzling for DMA-promoted LDS allocations"),
+    llvm::cl::init(true));
 
 namespace {
 
@@ -174,35 +182,53 @@ static LogicalResult materializeDMAPromotions(
       continue;
     }
 
-    // DMA path: alloc_tensor -> async_dma -> value_barrier -> transfer_read.
-    // Insert before the original transfer_read (replacing it).
+    // DMA path: alloc_tensor -> [swizzle_hint] -> async_dma -> value_barrier
+    // -> transfer_read.
     builder.setInsertionPoint(readOp);
     auto layout = layouts.lookup(readOp.getResult());
-    auto allocOp = allocateWorkgroupTensor(builder, loc, vectorType.getShape(),
-                                           vectorType.getElementType());
-
-    // Zero indices for both async_dma destination and the final transfer_read.
-    Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
-    SmallVector<Value> zeroIndices(vectorType.getRank(), c0);
 
     // Build permutation_map attribute if the original read has a non-identity
     // permutation map.
-    AffineMapAttr permMapAttr;
-    AffineMap permMap = readOp.getPermutationMap();
-    if (!permMap.isIdentity()) {
-      permMapAttr = AffineMapAttr::get(permMap);
+    AffineMapAttr permMapAttr = readOp.getPermutationMapAttr();
+
+    auto allocOp = allocateWorkgroupTensor(builder, loc, vectorType.getShape(),
+                                           vectorType.getElementType());
+    Value dmaDest = allocOp;
+    // Try to wrap the alloc in a swizzle_hint for bank conflict avoidance.
+    if (clEnableDMASwizzle && target) {
+      int64_t totalElements = vectorType.getNumElements();
+      int64_t elementBitWidth =
+          vectorType.getElementType().getIntOrFloatBitWidth();
+      // The compute layout's element tile determines the contiguous access
+      // width per thread during MMA reads. accessElems must divide this so
+      // ResolveSwizzleHints can correctly unroll the distributed loads.
+      auto nestedLayout = dyn_cast<IREE::VectorExt::NestedLayoutAttr>(layout);
+      int64_t computeAccessWidth =
+          nestedLayout ? llvm::product_of(nestedLayout.getElementTile()) : 1;
+      auto swizzleParams = getXorShuffleParamsForDMA(
+          target, elementBitWidth, totalElements, computeAccessWidth);
+      if (succeeded(swizzleParams)) {
+        LDBG() << "Using swizzled DMA path with rowElems="
+               << swizzleParams->rowElems
+               << " accessElems=" << swizzleParams->accessElems;
+        auto swizzleAttr = IREE::Codegen::XORShuffleAttr::get(
+            builder.getContext(), swizzleParams->rowElems,
+            swizzleParams->accessElems, /*row_stride=*/0, /*per_phase=*/0);
+        dmaDest = IREE::Codegen::SwizzleHintOp::create(builder, loc, allocOp,
+                                                       swizzleAttr);
+      }
     }
 
-    // Create the async_dma op (tensor form returns a result).
-    auto dmaOp = IREE::GPU::AsyncDMAOp::create(
-        builder, loc, allocOp.getType(), readOp.getBase(), readOp.getIndices(),
-        allocOp, zeroIndices, layout, permMapAttr, readOp.getInBoundsAttr());
+    Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
+    SmallVector<Value> zeroIndices(vectorType.getRank(), c0);
 
-    // Synchronize after DMA before reading.
+    auto dmaOp = IREE::GPU::AsyncDMAOp::create(
+        builder, loc, dmaDest.getType(), readOp.getBase(), readOp.getIndices(),
+        dmaDest, zeroIndices, layout, permMapAttr, readOp.getInBoundsAttr());
+
     auto synced =
         IREE::GPU::ValueBarrierOp::create(builder, loc, dmaOp.getResult());
 
-    // Read the vector from the barrier result.
     SmallVector<bool> readInBounds(vectorType.getRank(), true);
     Value replacement = vector::TransferReadOp::create(
         builder, loc, vectorType, synced.getResult(0), zeroIndices,
