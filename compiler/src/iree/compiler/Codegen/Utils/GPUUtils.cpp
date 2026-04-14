@@ -1262,13 +1262,6 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
     return std::nullopt;
   }
 
-  std::optional<SmallVector<int64_t>> maybeWorkgroupSize =
-      getWorkgroupSize(funcOp);
-  if (!maybeWorkgroupSize) {
-    return std::nullopt;
-  }
-  int64_t numThreads = llvm::product_of(*maybeWorkgroupSize);
-
   int64_t elementBits = elementType.getIntOrFloatBitWidth();
 
   IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp);
@@ -1281,22 +1274,19 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
     dmaSizes = dmaSizesAttr.asArrayRef();
   }
 
-  // Check alignment against all threads, not just one subgroup. DMA lowering
-  // requires all subgroups to participate, so the transfer must be large enough
-  // to distribute across numThreads * elementsPerLane elements.
-  int64_t minElementsPerWorkgroup = std::numeric_limits<int64_t>::max();
+  int64_t minElementsPerTransfer = std::numeric_limits<int64_t>::max();
   for (int64_t dmaSize : dmaSizes) {
     if (dmaSize % elementBits != 0) {
       continue;
     }
     int64_t elementsPerLane = dmaSize / elementBits;
-    int64_t elementsPerWorkgroup = numThreads * elementsPerLane;
-    minElementsPerWorkgroup =
-        std::min(minElementsPerWorkgroup, elementsPerWorkgroup);
+    int64_t elementsPerTransfer = *subgroupSize * elementsPerLane;
+    minElementsPerTransfer =
+        std::min(minElementsPerTransfer, elementsPerTransfer);
   }
 
-  if (minElementsPerWorkgroup == std::numeric_limits<int64_t>::max() ||
-      availableElements % minElementsPerWorkgroup != 0) {
+  if (minElementsPerTransfer == std::numeric_limits<int64_t>::max() ||
+      availableElements % minElementsPerTransfer != 0) {
     return std::nullopt;
   }
 
@@ -1319,8 +1309,9 @@ std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
 // constraints:
 //
 //   Read side:  ResolveSwizzleHints unrolls distributed vector.load ops in
-//               accessElems-sized chunks. The load width equals
-//               computeAccessWidth, so the divisibility is exact.
+//               accessElems-sized chunks. The load width equals the innermost
+//               element tile dimension of the compute layout, so the
+//               divisibility is exact.
 //
 //   Write side: Each gather_to_lds transfers elementsPerDMA contiguous source
 //               elements to a contiguous dest range. For the XOR swizzle to

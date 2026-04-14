@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <limits>
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUPromotionAnalysis.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
@@ -153,9 +154,20 @@ static LogicalResult materializeDMAPromotions(
       // for the full workgroup (all subgroups must participate).
       // TODO: Check if participation of only some subgroups makes sense.
       int64_t totalElements = vectorType.getNumElements();
-      if (!getDMAAlignedSubgroupSize(funcOp, vectorType.getElementType(),
-                                     totalElements)
-               .has_value()) {
+      int64_t numThreads = llvm::product_of(*getWorkgroupSize(funcOp));
+      int64_t elementBits = vectorType.getElementType().getIntOrFloatBitWidth();
+      ArrayRef<int64_t> dmaSizes = target.getWgp().getDmaSizes().asArrayRef();
+      int64_t minElementsPerWorkgroup = std::numeric_limits<int64_t>::max();
+      for (int64_t dmaSize : dmaSizes) {
+        if (dmaSize % elementBits != 0) {
+          continue;
+        }
+        int64_t elementsPerLane = dmaSize / elementBits;
+        minElementsPerWorkgroup =
+            std::min(minElementsPerWorkgroup, numThreads * elementsPerLane);
+      }
+      if (minElementsPerWorkgroup == std::numeric_limits<int64_t>::max() ||
+          totalElements % minElementsPerWorkgroup != 0) {
         LDBG() << "No suitable DMA size available, falling back to shared "
                << "memory promotion";
         eligible = false;
