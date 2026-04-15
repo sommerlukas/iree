@@ -904,21 +904,21 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
       cast<AffineDimExpr>(op.getValueMap().getResults().back()).getPosition();
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
+  int64_t prefetchStages = clPrefetchNumStages.getValue().value_or(0);
   // First try to find a schedule with an exactly matching intrinsic.
-  // TODO: Pass prefetchNumStages once attention supports prefetching.
   std::optional<std::pair<GPUMMASchedule, GPUMMASchedule>> attSchedule =
       deduceAttentionSchedule(
           qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds, maxSharedMemoryBytes,
           targetSubgroupSize, transposedQ, transposedK, transposedV,
           /*canUpcastAcc=*/false, /*mustBeAligned=*/true, useDirectLoad,
-          /*prefetchNumStages=*/0);
+          /*prefetchNumStages=*/prefetchStages);
   if (!attSchedule) {
     // Then try again by allowing upcasting accumulator.
     attSchedule = deduceAttentionSchedule(
         qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds, maxSharedMemoryBytes,
         targetSubgroupSize, transposedQ, transposedK, transposedV,
         /*canUpcastAcc=*/true, /*mustBeAligned=*/true, useDirectLoad,
-        /*prefetchNumStages=*/0);
+        /*prefetchNumStages=*/prefetchStages);
   }
 
   if (!attSchedule) {
@@ -1096,17 +1096,13 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
 
   if (useDirectLoad) {
     auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
-        context, /*prefetchNumStages=*/0,
+        context, /*prefetchNumStages=*/prefetchStages,
         /*no_reduce_shared_memory_bank_conflicts=*/true,
         /*use_igemm_convolution=*/false,
         /*reorder_workgroups_strategy=*/std::nullopt);
     pipelineAttrs.emplace_back(
         IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
   }
-
-  // TODO: We do not turn prefetching on even when requested by the prefetching
-  // flag because there is a shared memory allocation the two matmuls, which
-  // the prefetching pass cannot understand.
 
   auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
 
