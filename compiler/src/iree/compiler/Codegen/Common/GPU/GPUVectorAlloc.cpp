@@ -237,7 +237,8 @@ static LogicalResult materializeDMAPromotions(
 
     auto dmaOp = IREE::GPU::AsyncDMAOp::create(
         builder, loc, dmaDest.getType(), readOp.getBase(), readOp.getIndices(),
-        dmaDest, zeroIndices, layout, permMapAttr, readOp.getInBoundsAttr());
+        dmaDest, zeroIndices, TypeAttr::get(vectorType), permMapAttr,
+        readOp.getInBoundsAttr());
 
     auto synced =
         IREE::GPU::ValueBarrierOp::create(builder, loc, dmaOp.getResult());
