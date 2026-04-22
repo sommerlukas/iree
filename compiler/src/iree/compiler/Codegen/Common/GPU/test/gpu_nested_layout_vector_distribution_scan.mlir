@@ -111,6 +111,139 @@ builtin.module attributes { transform.with_named_sequence } {
 
 // -----
 
+// Test 5: Cross-subgroup inclusive scan.
+
+#layout_scan_cross = #iree_vector_ext.nested_layout<
+  subgroup_tile = [2],
+  batch_tile    = [1],
+  outer_tile    = [1],
+  thread_tile   = [4],
+  element_tile  = [4],
+
+  subgroup_strides = [1],
+  thread_strides   = [1]
+>
+
+// CHECK-LABEL: @scan_cross_subgroup_inclusive
+func.func @scan_cross_subgroup_inclusive(%src: vector<32xf32>, %init: vector<f32>) -> (vector<32xf32>, vector<f32>) {
+  %src_l = iree_vector_ext.to_layout %src to layout(#layout_scan_cross) : vector<32xf32>
+  %out:2 = vector.scan <add>, %src_l, %init {inclusive = true, reduction_dim = 0 : i64}
+    : vector<32xf32>, vector<f32>
+  return %out#0, %out#1 : vector<32xf32>, vector<f32>
+}
+
+builtin.module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%variant_op: !transform.any_op {transform.readonly}) {
+    %top_level_func = transform.structured.match ops{["func.func"]} in %variant_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.test_gpu_vector_distribution %top_level_func : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-DAG: %[[CST:.*]] = arith.constant dense<0.000000e+00> : vector<1x1xf32>
+// CHECK-DAG: %[[SRC_DIST:.*]] = iree_vector_ext.to_simt %{{.*}} : vector<32xf32> -> vector<1x1x4xf32>
+// Local inclusive scan with identity init.
+// CHECK: %[[LOCAL_SCAN:.*]], %[[LOCAL_TOTAL:.*]] = vector.scan <add>, %[[SRC_DIST]], %{{.*}} {inclusive = true, reduction_dim = 2 : i64}
+// Subgroup scan of localTotal.
+// CHECK: %[[SUBGROUP_SCAN:.*]], %[[SUBGROUP_TOTAL:.*]] = iree_gpu.subgroup_scan
+// Apply subgroup scan carry to local result.
+// CHECK: %[[BLOCK_INCR:.*]] = arith.addf %{{.*}}, %[[CST]] : vector<1x1xf32>
+// CHECK: %[[BLOCK_BCAST:.*]] = vector.broadcast %[[BLOCK_INCR]] : vector<1x1xf32> to vector<1x1x4xf32>
+// CHECK: %[[INTRA_SG_RESULT:.*]] = arith.addf %[[BLOCK_BCAST]], %[[LOCAL_SCAN]] : vector<1x1x4xf32>
+// batchOuterRunning = subgroupTotal (uniform across threads).
+// CHECK: %[[BO_RUNNING:.*]] = arith.addf %{{.*}}, %[[CST]] : vector<1x1xf32>
+// Cross-subgroup: last thread writes subgroup total to LDS.
+// CHECK: %[[ALLOC:.*]] = memref.alloc() : memref<2x1x1x1xf32, #gpu.address_space<workgroup>>
+// CHECK: scf.if
+// CHECK:   vector.transfer_write %[[BO_RUNNING]], %[[ALLOC]]
+// CHECK: gpu.barrier memfence [#gpu.address_space<workgroup>]
+// Scan over subgroup totals: load, select carry, load, accumulate.
+// CHECK: vector.transfer_read %[[ALLOC]]{{.*}} {in_bounds = [true, true]}
+// CHECK: %[[SG_CARRY:.*]] = arith.select %{{.*}}, %{{.*}}, %[[CST]] : vector<1x1xf32>
+// CHECK: vector.transfer_read %[[ALLOC]]{{.*}} {in_bounds = [true, true]}
+// Broadcast carry and adjust result.
+// CHECK: %[[CARRY_BCAST:.*]] = vector.broadcast %[[SG_CARRY]] : vector<1x1xf32> to vector<1x1x4xf32>
+// CHECK: %[[RESULT:.*]] = arith.addf %[[CARRY_BCAST]], %[[INTRA_SG_RESULT]] : vector<1x1x4xf32>
+// Accumulated value = total across all subgroups.
+// CHECK: %[[ACC:.*]] = vector.shape_cast %{{.*}} : vector<1x1xf32> to vector<f32>
+// CHECK: iree_vector_ext.to_simd %[[ACC]] : vector<f32> -> vector<f32>
+// CHECK: iree_vector_ext.to_simd %[[RESULT]] : vector<1x1x4xf32> -> vector<32xf32>
+
+// -----
+
+// Test 6: Cross-subgroup exclusive scan.
+
+#layout_scan_cross_excl = #iree_vector_ext.nested_layout<
+  subgroup_tile = [2],
+  batch_tile    = [1],
+  outer_tile    = [1],
+  thread_tile   = [4],
+  element_tile  = [4],
+
+  subgroup_strides = [1],
+  thread_strides   = [1]
+>
+
+// CHECK-LABEL: @scan_cross_subgroup_exclusive
+func.func @scan_cross_subgroup_exclusive(%src: vector<32xf32>, %init: vector<f32>) -> (vector<32xf32>, vector<f32>) {
+  %src_l = iree_vector_ext.to_layout %src to layout(#layout_scan_cross_excl) : vector<32xf32>
+  %out:2 = vector.scan <add>, %src_l, %init {inclusive = false, reduction_dim = 0 : i64}
+    : vector<32xf32>, vector<f32>
+  return %out#0, %out#1 : vector<32xf32>, vector<f32>
+}
+
+builtin.module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%variant_op: !transform.any_op {transform.readonly}) {
+    %top_level_func = transform.structured.match ops{["func.func"]} in %variant_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.test_gpu_vector_distribution %top_level_func : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-DAG: %[[CST:.*]] = arith.constant dense<0.000000e+00> : vector<1x1xf32>
+// CHECK-DAG: %[[SRC_DIST:.*]] = iree_vector_ext.to_simt %{{.*}} : vector<32xf32> -> vector<1x1x4xf32>
+// CHECK-DAG: %[[INIT_DIST:.*]] = iree_vector_ext.to_simt %{{.*}} : vector<f32> -> vector<f32>
+// Local exclusive scan with identity init.
+// CHECK: %[[LOCAL_SCAN:.*]], %[[ACC_VAL:.*]] = vector.scan <add>, %[[SRC_DIST]], %[[CST]] {inclusive = false, reduction_dim = 2 : i64}
+// Fix up localTotal: combine accumulated_value with last source element.
+// CHECK: %[[LAST_ELEM:.*]] = vector.extract_strided_slice %[[SRC_DIST]] {offsets = [0, 0, 3], sizes = [1, 1, 1], strides = [1, 1, 1]}
+// CHECK: %[[LAST_FLAT:.*]] = vector.shape_cast %[[LAST_ELEM]] : vector<1x1x1xf32> to vector<1x1xf32>
+// CHECK: %[[LOCAL_TOTAL:.*]] = arith.addf %[[ACC_VAL]], %[[LAST_FLAT]] : vector<1x1xf32>
+// Subgroup scan of fixed-up localTotal.
+// CHECK: %[[SUBGROUP_SCAN:.*]], %[[SUBGROUP_TOTAL:.*]] = iree_gpu.subgroup_scan
+// Apply subgroup scan carry to local result.
+// CHECK: %[[INTRA_SG_RESULT:.*]] = arith.addf %{{.*}}, %[[LOCAL_SCAN]] : vector<1x1x4xf32>
+// batchOuterRunning = subgroupTotal (uniform across threads).
+// CHECK: %[[BO_RUNNING:.*]] = arith.addf %{{.*}}, %[[CST]] : vector<1x1xf32>
+// Cross-subgroup: last thread writes subgroup total to LDS.
+// CHECK: %[[ALLOC:.*]] = memref.alloc() : memref<2x1x1x1xf32, #gpu.address_space<workgroup>>
+// CHECK: scf.if
+// CHECK:   vector.transfer_write %[[BO_RUNNING]], %[[ALLOC]]
+// CHECK: gpu.barrier memfence [#gpu.address_space<workgroup>]
+// Scan over subgroup totals: load sg0 total, select carry.
+// (totalCarry is unused in exclusive path, so sg1 read is optimized away.)
+// CHECK: vector.transfer_read %[[ALLOC]]{{.*}} {in_bounds = [true, true]}
+// CHECK: %[[SG_CARRY:.*]] = arith.select %{{.*}}, %{{.*}}, %[[CST]] : vector<1x1xf32>
+// Broadcast carry and adjust result.
+// CHECK: %[[CARRY_BCAST:.*]] = vector.broadcast %[[SG_CARRY]] : vector<1x1xf32> to vector<1x1x4xf32>
+// CHECK: %[[PRE_INIT:.*]] = arith.addf %[[CARRY_BCAST]], %[[INTRA_SG_RESULT]] : vector<1x1x4xf32>
+// Application of user init via broadcast + combine.
+// CHECK: %[[INIT_BCAST:.*]] = vector.broadcast %[[INIT_DIST]] : vector<f32> to vector<1x1x4xf32>
+// CHECK: %[[RESULT:.*]] = arith.addf %[[INIT_BCAST]], %[[PRE_INIT]] : vector<1x1x4xf32>
+// Accumulated value: last thread of last subgroup writes to LDS.
+// CHECK: %[[LAST_WRITER:.*]] = arith.andi %{{.*}}, %{{.*}} : i1
+// CHECK: %[[ACC_ALLOC:.*]] = memref.alloc() : memref<1xf32, #gpu.address_space<workgroup>>
+// CHECK: scf.if %[[LAST_WRITER]]
+// CHECK:   %[[LAST_ACC:.*]] = vector.extract %[[RESULT]][0, 0, 3] : f32 from vector<1x1x4xf32>
+// CHECK:   memref.store %[[LAST_ACC]], %[[ACC_ALLOC]][%{{.*}}]
+// CHECK: gpu.barrier memfence [#gpu.address_space<workgroup>]
+// CHECK: %[[ACC_SCALAR:.*]] = memref.load %[[ACC_ALLOC]][%{{.*}}]
+// CHECK: %[[ACC:.*]] = vector.broadcast %[[ACC_SCALAR]] : f32 to vector<f32>
+// CHECK: iree_vector_ext.to_simd %[[ACC]] : vector<f32> -> vector<f32>
+// CHECK: iree_vector_ext.to_simd %[[RESULT]] : vector<1x1x4xf32> -> vector<32xf32>
+
+// -----
+
 // Test 3: Multi (b,o) inclusive scan.
 // Layout: batch=2 along scan dim -> two (b,o) iterations.
 
