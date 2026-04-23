@@ -2428,6 +2428,24 @@ readVectorPayloadFromScalarBuffer(RewriterBase &rewriter, Location loc,
       inBounds);
 }
 
+static Value extractLastScanElement(RewriterBase &rewriter, Location loc,
+                                    Value vector, ArrayRef<int64_t> distShape,
+                                    int64_t batchIdx, int64_t outerIdx,
+                                    int64_t elemIdx, VectorType resultType) {
+  SmallVector<int64_t> lastOffsets(distShape.size(), 0);
+  SmallVector<int64_t> lastSizes(distShape.begin(), distShape.end());
+  lastOffsets[batchIdx] = distShape[batchIdx] - 1;
+  lastOffsets[outerIdx] = distShape[outerIdx] - 1;
+  lastOffsets[elemIdx] = distShape[elemIdx] - 1;
+  lastSizes[batchIdx] = 1;
+  lastSizes[outerIdx] = 1;
+  lastSizes[elemIdx] = 1;
+  SmallVector<int64_t> extractStrides(distShape.size(), 1);
+  Value lastSlice = vector::ExtractStridedSliceOp::create(
+      rewriter, loc, vector, lastOffsets, lastSizes, extractStrides);
+  return vector::ShapeCastOp::create(rewriter, loc, resultType, lastSlice);
+}
+
 struct CrossSubgroupCoordInfo {
   Value subgroupId;
   Value threadCoord;
@@ -2487,23 +2505,40 @@ static Value broadcastPayloadFromWorkgroupMemory(
       rewriter, loc, payloadType, buffer, ValueRange{parallelCoord}, padScalar);
 }
 
+struct CrossSubgroupScanResult {
+  VectorValue adjustedResult;
+  Value totalCarry;
+  Value exclusiveAccumulatedValue;
+};
+
 /// Performs a cross-subgroup scan over subgroup totals using workgroup memory.
 /// Returns the subgroup-local result shifted by the prefix of all previous
-/// subgroups and the total value across all subgroups.
-static FailureOr<std::pair<VectorValue, Value>>
-doCrossSubgroupScan(RewriterBase &rewriter, Location loc,
-                    NestedLayoutAttr srcLayout, ArrayRef<Value> warpIndices,
-                    ArrayRef<Value> threadIndices, int64_t scanDim,
-                    vector::CombiningKind kind, VectorValue subgroupLocalResult,
-                    Value subgroupTotal) {
+/// subgroups and the total value across all subgroups. For exclusive scans, it
+/// can additionally compute the final `accumulated_value` without a second
+/// workgroup round-trip by storing the last subgroup's local exclusive tail
+/// before the barrier and combining it with the carry before the last
+/// subgroup.
+static CrossSubgroupScanResult doCrossSubgroupScan(
+    RewriterBase &rewriter, Location loc, NestedLayoutAttr srcLayout,
+    ArrayRef<Value> warpIndices, ArrayRef<Value> threadIndices, int64_t scanDim,
+    vector::CombiningKind kind, VectorValue subgroupLocalResult,
+    Value subgroupTotal, Value subgroupLocalAccumulatedValue = {},
+    Value initialValue = {}) {
   int64_t rank = srcLayout.getRank();
   CrossSubgroupCoordInfo coordInfo = getCrossSubgroupCoordInfo(
       rewriter, loc, srcLayout, warpIndices, threadIndices, scanDim);
   Value lastThreadCoord = arith::ConstantIndexOp::create(
       rewriter, loc, srcLayout.getThreadTile()[scanDim] - 1);
+  Value lastSubgroupId = arith::ConstantIndexOp::create(
+      rewriter, loc, srcLayout.getSubgroupTile()[scanDim] - 1);
   Value isWriter =
       arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
                             coordInfo.threadCoord, lastThreadCoord);
+  Value isLastSubgroup =
+      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
+                            coordInfo.subgroupId, lastSubgroupId);
+  Value isAccumulatedWriter =
+      arith::AndIOp::create(rewriter, loc, isWriter, isLastSubgroup);
 
   auto totalType = cast<VectorType>(subgroupTotal.getType());
   MemRefType bufferType = getWorkgroupBufferTypeForVectorPayload(
@@ -2511,6 +2546,17 @@ doCrossSubgroupScan(RewriterBase &rewriter, Location loc,
       {srcLayout.getSubgroupTile()[scanDim], coordInfo.numParallelCoords},
       totalType);
   Value buffer = memref::AllocOp::create(rewriter, loc, bufferType);
+  Value accumulatedBuffer;
+  auto accumulatedType =
+      subgroupLocalAccumulatedValue
+          ? cast<VectorType>(subgroupLocalAccumulatedValue.getType())
+          : VectorType();
+  if (subgroupLocalAccumulatedValue) {
+    MemRefType accumulatedBufferType = getWorkgroupBufferTypeForVectorPayload(
+        rewriter.getContext(), {coordInfo.numParallelCoords}, accumulatedType);
+    accumulatedBuffer =
+        memref::AllocOp::create(rewriter, loc, accumulatedBufferType);
+  }
 
   auto ifOp = scf::IfOp::create(rewriter, loc, isWriter);
   {
@@ -2520,12 +2566,22 @@ doCrossSubgroupScan(RewriterBase &rewriter, Location loc,
         rewriter, loc, subgroupTotal, buffer,
         ValueRange{coordInfo.subgroupId, coordInfo.parallelCoord});
   }
+  if (subgroupLocalAccumulatedValue) {
+    auto accumulatedIfOp =
+        scf::IfOp::create(rewriter, loc, isAccumulatedWriter);
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(accumulatedIfOp.thenYield());
+    writeVectorPayloadToScalarBuffer(
+        rewriter, loc, subgroupLocalAccumulatedValue, accumulatedBuffer,
+        ValueRange{coordInfo.parallelCoord});
+  }
 
   gpu::BarrierOp::create(rewriter, loc, buffer);
 
   Value subgroupCarry =
       getCombiningIdentityValue(loc, rewriter, kind, totalType);
   Value totalCarry = subgroupCarry;
+  Value lastSubgroupCarry = subgroupCarry;
   Value padScalar = getCombiningIdentityValue(loc, rewriter, kind,
                                               totalType.getElementType());
   for (int64_t subgroupIdx = 0, e = srcLayout.getSubgroupTile()[scanDim];
@@ -2537,6 +2593,11 @@ doCrossSubgroupScan(RewriterBase &rewriter, Location loc,
                               coordInfo.subgroupId, subgroupIdxVal);
     subgroupCarry = arith::SelectOp::create(rewriter, loc, selectCarry,
                                             totalCarry, subgroupCarry);
+    Value selectLastSubgroupCarry =
+        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
+                              lastSubgroupId, subgroupIdxVal);
+    lastSubgroupCarry = arith::SelectOp::create(
+        rewriter, loc, selectLastSubgroupCarry, totalCarry, lastSubgroupCarry);
     Value loaded = readVectorPayloadFromScalarBuffer(
         rewriter, loc, totalType, buffer,
         ValueRange{subgroupIdxVal, coordInfo.parallelCoord}, padScalar);
@@ -2556,34 +2617,23 @@ doCrossSubgroupScan(RewriterBase &rewriter, Location loc,
                                                   distShape, scanDimMask);
   Value adjustedResult = vector::makeArithReduction(
       rewriter, loc, kind, broadcastedCarry, subgroupLocalResult);
-  return std::pair{cast<VectorValue>(adjustedResult), totalCarry};
-}
-
-/// Broadcasts the exclusive accumulated value from the last subgroup/thread to
-/// all threads with the same non-scan coordinates using workgroup memory.
-static Value broadcastFromLastSubgroup(
-    RewriterBase &rewriter, Location loc, NestedLayoutAttr srcLayout,
-    ArrayRef<Value> warpIndices, ArrayRef<Value> threadIndices, int64_t scanDim,
-    VectorType accumulatedType, Value perThreadAccum) {
-  CrossSubgroupCoordInfo coordInfo = getCrossSubgroupCoordInfo(
-      rewriter, loc, srcLayout, warpIndices, threadIndices, scanDim);
-  Value lastSubgroupId = arith::ConstantIndexOp::create(
-      rewriter, loc, srcLayout.getSubgroupTile()[scanDim] - 1);
-  Value lastThreadCoord = arith::ConstantIndexOp::create(
-      rewriter, loc, srcLayout.getThreadTile()[scanDim] - 1);
-  Value isLastSubgroup =
-      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                            coordInfo.subgroupId, lastSubgroupId);
-  Value isLastThread =
-      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                            coordInfo.threadCoord, lastThreadCoord);
-  Value isWriter =
-      arith::AndIOp::create(rewriter, loc, isLastSubgroup, isLastThread);
-  Value padScalar = arith::ConstantOp::create(
-      rewriter, loc, rewriter.getZeroAttr(accumulatedType.getElementType()));
-  return broadcastPayloadFromWorkgroupMemory(
-      rewriter, loc, isWriter, accumulatedType, perThreadAccum,
-      coordInfo.parallelCoord, coordInfo.numParallelCoords, padScalar);
+  Value exclusiveAccumulatedValue;
+  if (subgroupLocalAccumulatedValue) {
+    Value accumulatedPadScalar = getCombiningIdentityValue(
+        loc, rewriter, kind, accumulatedType.getElementType());
+    exclusiveAccumulatedValue = readVectorPayloadFromScalarBuffer(
+        rewriter, loc, accumulatedType, accumulatedBuffer,
+        ValueRange{coordInfo.parallelCoord}, accumulatedPadScalar);
+    Value reshapedLastSubgroupCarry = vector::ShapeCastOp::create(
+        rewriter, loc, accumulatedType, lastSubgroupCarry);
+    exclusiveAccumulatedValue = vector::makeArithReduction(
+        rewriter, loc, kind, reshapedLastSubgroupCarry,
+        exclusiveAccumulatedValue);
+    exclusiveAccumulatedValue = vector::makeArithReduction(
+        rewriter, loc, kind, initialValue, exclusiveAccumulatedValue);
+  }
+  return CrossSubgroupScanResult{cast<VectorValue>(adjustedResult), totalCarry,
+                                 exclusiveAccumulatedValue};
 }
 
 /// Distributes `vector.scan` across GPU threads.
@@ -2732,8 +2782,6 @@ struct DistributeScan final : OpDistributionPattern<vector::ScanOp> {
     VectorValue disInit = getDistributed(rewriter, init, sig[init]);
 
     // Layout tile sizes along scan dimension.
-    int64_t batchSize = srcLayout.getBatchTile()[scanDim];
-    int64_t outerSize = srcLayout.getOuterTile()[scanDim];
     int64_t threadSize = srcLayout.getThreadTile()[scanDim];
     int64_t elementSize = srcLayout.getElementTile()[scanDim];
     bool hasSubgroupReductions = srcLayout.getSubgroupTile()[scanDim] > 1;
@@ -2863,17 +2911,21 @@ struct DistributeScan final : OpDistributionPattern<vector::ScanOp> {
           rewriter, loc, kind, batchOuterRunning, subgroupTotal);
     }
 
+    Value crossSubgroupAccumulatedValue;
     if (hasSubgroupReductions) {
-      FailureOr<std::pair<VectorValue, Value>> resultAndTotal =
-          doCrossSubgroupScan(rewriter, loc, srcLayout, warpIndices,
-                              threadIndices, scanDim, kind,
-                              cast<VectorValue>(result), batchOuterRunning);
-      if (failed(resultAndTotal)) {
-        return rewriter.notifyMatchFailure(
-            scanOp, "failed to perform cross-subgroup scan");
+      Value subgroupLocalAccumulatedValue;
+      if (!inclusive) {
+        subgroupLocalAccumulatedValue =
+            extractLastScanElement(rewriter, loc, result, distShape, batchIdx,
+                                   outerIdx, elemIdx, initDistType);
       }
-      result = resultAndTotal->first;
-      batchOuterRunning = resultAndTotal->second;
+      CrossSubgroupScanResult resultAndTotal = doCrossSubgroupScan(
+          rewriter, loc, srcLayout, warpIndices, threadIndices, scanDim, kind,
+          cast<VectorValue>(result), batchOuterRunning,
+          subgroupLocalAccumulatedValue, disInit);
+      result = resultAndTotal.adjustedResult;
+      batchOuterRunning = resultAndTotal.totalCarry;
+      crossSubgroupAccumulatedValue = resultAndTotal.exclusiveAccumulatedValue;
     }
 
     // For the inclusive case we're done.
@@ -2908,32 +2960,21 @@ struct DistributeScan final : OpDistributionPattern<vector::ScanOp> {
                                         result);
 
     Value accumulatedValue;
-    // Extract the last element along the scan dimension.
-    SmallVector<int64_t> lastOffsets(distShape.size(), 0);
-    SmallVector<int64_t> lastSizes(distShape);
-    lastOffsets[batchIdx] = batchSize - 1;
-    lastOffsets[outerIdx] = outerSize - 1;
-    lastOffsets[elemIdx] = elementSize - 1;
-    lastSizes[batchIdx] = 1;
-    lastSizes[outerIdx] = 1;
-    lastSizes[elemIdx] = 1;
-    SmallVector<int64_t> extractStrides(distShape.size(), 1);
-    Value lastSlice = vector::ExtractStridedSliceOp::create(
-        rewriter, loc, result, lastOffsets, lastSizes, extractStrides);
-    Value perThreadAccum =
-        vector::ShapeCastOp::create(rewriter, loc, initDistType, lastSlice);
 
     if (hasSubgroupReductions) {
-      accumulatedValue = broadcastFromLastSubgroup(
-          rewriter, loc, srcLayout, warpIndices, threadIndices, scanDim,
-          initDistType, perThreadAccum);
+      accumulatedValue = crossSubgroupAccumulatedValue;
     } else if (threadSize > 1) {
+      Value perThreadAccum =
+          extractLastScanElement(rewriter, loc, result, distShape, batchIdx,
+                                 outerIdx, elemIdx, initDistType);
       int64_t clusterStride = srcLayout.getThreadStrides()[scanDim];
       accumulatedValue =
           broadcastFromLastClusterLane(rewriter, loc, perThreadAccum,
                                        threadSize, clusterStride, subgroupSize);
     } else {
-      accumulatedValue = perThreadAccum;
+      accumulatedValue =
+          extractLastScanElement(rewriter, loc, result, distShape, batchIdx,
+                                 outerIdx, elemIdx, initDistType);
     }
 
     replaceOpWithDistributedValues(

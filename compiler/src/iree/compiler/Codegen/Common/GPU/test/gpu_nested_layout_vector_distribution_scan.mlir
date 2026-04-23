@@ -215,30 +215,33 @@ builtin.module attributes { transform.with_named_sequence } {
 // CHECK: %[[INTRA_SG_RESULT:.*]] = arith.addf %{{.*}}, %[[LOCAL_SCAN]] : vector<1x1x4xf32>
 // batchOuterRunning = subgroupTotal (uniform across threads).
 // CHECK: %[[BO_RUNNING:.*]] = arith.addf %{{.*}}, %[[CST]] : vector<1x1xf32>
-// Cross-subgroup: last thread writes subgroup total to LDS.
+// Cross-subgroup: last thread writes subgroup total to LDS, and the last
+// subgroup/thread also writes its local exclusive tail before the barrier.
 // CHECK: %[[ALLOC:.*]] = memref.alloc() : memref<2x1x1x1xf32, #gpu.address_space<workgroup>>
+// CHECK: %[[ACC_ALLOC:.*]] = memref.alloc() : memref<1xf32, #gpu.address_space<workgroup>>
 // CHECK: scf.if
 // CHECK:   vector.transfer_write %[[BO_RUNNING]], %[[ALLOC]]
+// CHECK: scf.if %{{.*}}
+// CHECK:   %[[LAST_LOCAL_ACC:.*]] = vector.extract %[[INTRA_SG_RESULT]][0, 0, 3] : f32 from vector<1x1x4xf32>
+// CHECK:   memref.store %[[LAST_LOCAL_ACC]], %[[ACC_ALLOC]][%{{.*}}]
 // CHECK: gpu.barrier memfence [#gpu.address_space<workgroup>]
 // Scan over subgroup totals: load sg0 total, select carry.
-// (totalCarry is unused in exclusive path, so sg1 read is optimized away.)
 // CHECK: vector.transfer_read %[[ALLOC]]{{.*}} {in_bounds = [true, true]}
 // CHECK: %[[SG_CARRY:.*]] = arith.select %{{.*}}, %{{.*}}, %[[CST]] : vector<1x1xf32>
 // Broadcast carry and adjust result.
 // CHECK: %[[CARRY_BCAST:.*]] = vector.broadcast %[[SG_CARRY]] : vector<1x1xf32> to vector<1x1x4xf32>
 // CHECK: %[[PRE_INIT:.*]] = arith.addf %[[CARRY_BCAST]], %[[INTRA_SG_RESULT]] : vector<1x1x4xf32>
-// Application of user init via broadcast + combine.
+// Reconstruct accumulated_value from the carry before the last subgroup, the
+// stored local exclusive tail, and the user init.
+// CHECK: %[[ACC_SCALAR:.*]] = memref.load %[[ACC_ALLOC]][%{{.*}}]
+// CHECK: %[[ACC_LOCAL:.*]] = vector.broadcast %[[ACC_SCALAR]] : f32 to vector<f32>
+// CHECK: %[[LAST_SG_CARRY:.*]] = vector.shape_cast %{{.*}} : vector<1x1xf32> to vector<f32>
+// CHECK: %[[ACC_WITH_CARRY:.*]] = arith.addf %[[LAST_SG_CARRY]], %[[ACC_LOCAL]] : vector<f32>
+// CHECK: %[[ACC:.*]] = arith.addf %[[INIT_DIST]], %[[ACC_WITH_CARRY]] : vector<f32>
+// Application of user init to the distributed result still happens via
+// broadcast + combine.
 // CHECK: %[[INIT_BCAST:.*]] = vector.broadcast %[[INIT_DIST]] : vector<f32> to vector<1x1x4xf32>
 // CHECK: %[[RESULT:.*]] = arith.addf %[[INIT_BCAST]], %[[PRE_INIT]] : vector<1x1x4xf32>
-// Accumulated value: last thread of last subgroup writes to LDS.
-// CHECK: %[[LAST_WRITER:.*]] = arith.andi %{{.*}}, %{{.*}} : i1
-// CHECK: %[[ACC_ALLOC:.*]] = memref.alloc() : memref<1xf32, #gpu.address_space<workgroup>>
-// CHECK: scf.if %[[LAST_WRITER]]
-// CHECK:   %[[LAST_ACC:.*]] = vector.extract %[[RESULT]][0, 0, 3] : f32 from vector<1x1x4xf32>
-// CHECK:   memref.store %[[LAST_ACC]], %[[ACC_ALLOC]][%{{.*}}]
-// CHECK: gpu.barrier memfence [#gpu.address_space<workgroup>]
-// CHECK: %[[ACC_SCALAR:.*]] = memref.load %[[ACC_ALLOC]][%{{.*}}]
-// CHECK: %[[ACC:.*]] = vector.broadcast %[[ACC_SCALAR]] : f32 to vector<f32>
 // CHECK: iree_vector_ext.to_simd %[[ACC]] : vector<f32> -> vector<f32>
 // CHECK: iree_vector_ext.to_simd %[[RESULT]] : vector<1x1x4xf32> -> vector<32xf32>
 
