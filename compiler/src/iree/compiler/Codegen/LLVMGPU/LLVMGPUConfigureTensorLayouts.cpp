@@ -363,12 +363,18 @@ static LogicalResult setDerivedThreadConfigLayout(
       static_cast<unsigned>(IREE::GPU::TilingLevel::Thread), linalgOp);
 
   SmallVector<int64_t> opShape = linalgOp.getStaticLoopRanges();
-  std::optional<VectorizationTileSizes> sizes =
-      inferSizesFromIR(linalgOp, std::nullopt);
-  // Even though the opShape could be dynamic, we could potentially
-  // infer the vector shape
-  if (sizes.has_value()) {
-    opShape = sizes.value().vectorSizes;
+  if (auto explicitTileSizes = linalgOp->getAttrOfType<DenseI64ArrayAttr>(
+          kVectorTileSizesAttrName)) {
+    opShape.assign(explicitTileSizes.asArrayRef().begin(),
+                   explicitTileSizes.asArrayRef().end());
+  } else {
+    std::optional<VectorizationTileSizes> sizes =
+        inferSizesFromIR(linalgOp, std::nullopt);
+    // Even though the opShape could be dynamic, we could potentially
+    // infer the vector shape
+    if (sizes.has_value()) {
+      opShape = sizes.value().vectorSizes;
+    }
   }
 
   for (auto [index, size, element] : llvm::enumerate(opShape, elementTile)) {

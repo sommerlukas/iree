@@ -82,6 +82,8 @@ FailureOr<Basis> getBasis(IREE::GPU::LoweringConfigAttr config,
 
 constexpr StringLiteral kPromoteOperandsName = "promote_operands";
 constexpr StringLiteral kPromotionTypesName = "promotion_types";
+constexpr StringLiteral kPromotedTileShapesName = "promoted_tile_shapes";
+
 std::optional<SmallVector<int64_t>>
 getPromotedOperandList(LoweringConfigAttr config) {
   auto array = config.getAttributes().getAs<ArrayAttr>(kPromoteOperandsName);
@@ -100,10 +102,28 @@ getPromotionTypesList(LoweringConfigAttr config) {
   return array.getValue();
 }
 
-void appendPromotedOperandsList(MLIRContext *context,
-                                SmallVectorImpl<NamedAttribute> &attrs,
-                                ArrayRef<int64_t> operands,
-                                ArrayRef<Attribute> promotionTypes) {
+std::optional<SmallVector<SmallVector<int64_t>>>
+getPromotedTileShapesList(LoweringConfigAttr config) {
+  auto array = config.getAttributes().getAs<ArrayAttr>(kPromotedTileShapesName);
+  if (!array) {
+    return std::nullopt;
+  }
+  SmallVector<SmallVector<int64_t>> result;
+  result.reserve(array.size());
+  for (Attribute attr : array) {
+    auto dense = dyn_cast<DenseI64ArrayAttr>(attr);
+    if (!dense) {
+      return std::nullopt;
+    }
+    result.emplace_back(dense.asArrayRef().begin(), dense.asArrayRef().end());
+  }
+  return result;
+}
+
+void appendPromotedOperandsList(
+    MLIRContext *context, SmallVectorImpl<NamedAttribute> &attrs,
+    ArrayRef<int64_t> operands, ArrayRef<Attribute> promotionTypes,
+    std::optional<ArrayRef<SmallVector<int64_t>>> promotedTileShapes) {
   Builder b(context);
   attrs.emplace_back(kPromoteOperandsName, b.getI64ArrayAttr(operands));
   if (!promotionTypes.empty()) {
@@ -111,19 +131,36 @@ void appendPromotedOperandsList(MLIRContext *context,
            "Promotion types size must match promoted operands size");
     attrs.emplace_back(kPromotionTypesName, b.getArrayAttr(promotionTypes));
   }
+  if (promotedTileShapes) {
+    assert(promotedTileShapes->size() == operands.size() &&
+           "Promoted tile shapes size must match promoted operands size");
+    SmallVector<Attribute> shapeAttrs;
+    shapeAttrs.reserve(promotedTileShapes->size());
+    for (ArrayRef<int64_t> shape : promotedTileShapes.value()) {
+      shapeAttrs.push_back(b.getDenseI64ArrayAttr(shape));
+    }
+    attrs.emplace_back(kPromotedTileShapesName, b.getArrayAttr(shapeAttrs));
+  }
 }
-IREE::GPU::LoweringConfigAttr
-setPromotedOperandsList(MLIRContext *context,
-                        IREE::GPU::LoweringConfigAttr currAttr,
-                        ArrayRef<int64_t> operands,
-                        std::optional<ArrayRef<Attribute>> promotionTypes) {
+IREE::GPU::LoweringConfigAttr setPromotedOperandsList(
+    MLIRContext *context, IREE::GPU::LoweringConfigAttr currAttr,
+    ArrayRef<int64_t> operands,
+    std::optional<ArrayRef<Attribute>> promotionTypes,
+    std::optional<ArrayRef<SmallVector<int64_t>>> promotedTileShapes) {
   Builder b(context);
   DictionaryAttr currAttributes = currAttr.getAttributes();
   NamedAttrList attributes(currAttributes);
   std::optional<SmallVector<int64_t>> currPromotedOperandsList =
       getPromotedOperandList(currAttr);
+  std::optional<SmallVector<SmallVector<int64_t>>> currPromotedTileShapes =
+      getPromotedTileShapesList(currAttr);
   if (currPromotedOperandsList &&
-      currPromotedOperandsList.value() == operands) {
+      currPromotedOperandsList.value() == operands &&
+      ((!promotedTileShapes && !currPromotedTileShapes) ||
+       (currPromotedTileShapes &&
+        currPromotedTileShapes.value() ==
+            SmallVector<SmallVector<int64_t>>(promotedTileShapes->begin(),
+                                              promotedTileShapes->end())))) {
     return currAttr;
   }
 
@@ -133,6 +170,16 @@ setPromotedOperandsList(MLIRContext *context,
 
   if (promotionTypes) {
     attributes.set(kPromotionTypesName, b.getArrayAttr(promotionTypes.value()));
+  }
+  if (promotedTileShapes) {
+    SmallVector<Attribute> shapeAttrs;
+    shapeAttrs.reserve(promotedTileShapes->size());
+    for (ArrayRef<int64_t> shape : promotedTileShapes.value()) {
+      shapeAttrs.push_back(b.getDenseI64ArrayAttr(shape));
+    }
+    attributes.set(kPromotedTileShapesName, b.getArrayAttr(shapeAttrs));
+  } else {
+    attributes.erase(kPromotedTileShapesName);
   }
   return IREE::GPU::LoweringConfigAttr::get(context,
                                             attributes.getDictionary(context));

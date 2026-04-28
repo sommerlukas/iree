@@ -80,6 +80,75 @@ static llvm::cl::opt<bool> clGPUEnableReductionVectorDistribution(
         "enable the usage of the reduction vector distribution pipeline"),
     llvm::cl::init(true));
 
+struct AttentionTilePlan {
+  SmallVector<int64_t> workgroupTileSizes;
+  SmallVector<int64_t> reductionTileSizes;
+  SmallVector<int64_t> promotedDomainTileSizes;
+};
+
+static AttentionTilePlan
+getAttentionTilePlan(const IREE::LinalgExt::AttentionOpDetail &opInfo,
+                     const GPUMMASchedule &pvSchedule, ArrayRef<int64_t> mDims,
+                     ArrayRef<int64_t> nDims, ArrayRef<int64_t> k2Dims) {
+  AttentionTilePlan plan{SmallVector<int64_t>(opInfo.getDomainRank(), 0),
+                         SmallVector<int64_t>(opInfo.getDomainRank(), 0),
+                         SmallVector<int64_t>(opInfo.getDomainRank(), 0)};
+
+  for (int64_t batch : opInfo.getBatchDims()) {
+    plan.workgroupTileSizes[batch] = 1;
+    plan.promotedDomainTileSizes[batch] = 1;
+  }
+  for (int64_t m : llvm::drop_end(opInfo.getMDims())) {
+    plan.workgroupTileSizes[m] = 1;
+    plan.promotedDomainTileSizes[m] = 1;
+  }
+  for (int64_t n : llvm::drop_end(opInfo.getNDims())) {
+    plan.workgroupTileSizes[n] = 1;
+    plan.promotedDomainTileSizes[n] = 1;
+  }
+  for (int64_t k2 : llvm::drop_end(opInfo.getK2Dims())) {
+    plan.reductionTileSizes[k2] = 1;
+    plan.promotedDomainTileSizes[k2] = 1;
+  }
+
+  for (auto [i, mDim] : llvm::enumerate(mDims)) {
+    int64_t tileSize = pvSchedule.mSubgroupCounts[i] * pvSchedule.mTileSizes[i];
+    if (i == mDims.size() - 1) {
+      tileSize *= llvm::product_of(pvSchedule.mSizes);
+    }
+    plan.workgroupTileSizes[mDim] = tileSize;
+    plan.promotedDomainTileSizes[mDim] = tileSize;
+  }
+  for (auto [i, nDim] : llvm::enumerate(nDims)) {
+    int64_t tileSize = pvSchedule.nSubgroupCounts[i] * pvSchedule.nTileSizes[i];
+    if (i == nDims.size() - 1) {
+      tileSize *= llvm::product_of(pvSchedule.nSizes);
+    }
+    plan.workgroupTileSizes[nDim] = tileSize;
+    plan.promotedDomainTileSizes[nDim] = tileSize;
+  }
+  for (auto [i, k2Dim] : llvm::enumerate(k2Dims)) {
+    int64_t tileSize = pvSchedule.kTileSizes[i];
+    if (i == k2Dims.size() - 1) {
+      tileSize *= llvm::product_of(pvSchedule.kSizes);
+    }
+    plan.reductionTileSizes[k2Dim] = tileSize;
+    plan.promotedDomainTileSizes[k2Dim] = tileSize;
+  }
+
+  return plan;
+}
+
+static SmallVector<int64_t>
+getAttentionPromotedTileShape(AffineMap indexingMap,
+                              ArrayRef<int64_t> domainTileSizes) {
+  SmallVector<int64_t> shape =
+      applyPermutationMap(indexingMap, domainTileSizes);
+  llvm::transform(shape, shape.begin(),
+                  [](int64_t tileSize) { return tileSize > 0 ? tileSize : 1; });
+  return shape;
+}
+
 // TODO (nirvedhmeshram): Drop this whole path after we have support with
 // TileAndFuse pipeline from completion of
 // https://github.com/iree-org/iree/issues/18858
@@ -932,62 +1001,61 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
       ShapedType::getNumElements(pvSchedule.mSubgroupCounts);
   std::array<int64_t, 3> workgroupSize{flatWorkgroupSize, 1, 1};
 
-  SmallVector<int64_t> workgroupTileSizes(opInfo.getDomainRank(), 0);
-  SmallVector<int64_t> reductionTileSizes(opInfo.getDomainRank(), 0);
+  AttentionTilePlan tilePlan =
+      getAttentionTilePlan(opInfo, pvSchedule, mDims, nDims, k2Dims);
   IREE::GPU::Basis subgroupBasis = {
       SmallVector<int64_t>(opInfo.getDomainRank(), 1),
       // Distribute subgroups from outer to inner. Mostly an arbitrary choice.
       // We can change this if it matters.
       llvm::to_vector(llvm::seq<int64_t>(opInfo.getDomainRank()))};
-
-  // Tile all batch dimensions with unit size.
-  for (int64_t batch : opInfo.getBatchDims()) {
-    workgroupTileSizes[batch] = 1;
-  }
-  // Tile all m, n, and k2 dimensions to 1 except the innermost. Unit dims
-  // from this tiling are folded before vectorization. k1 dimension cannot be
-  // tiled, so we leave it.
-  for (int64_t m : llvm::drop_end(opInfo.getMDims())) {
-    workgroupTileSizes[m] = 1;
-  }
-  for (int64_t n : llvm::drop_end(opInfo.getNDims())) {
-    workgroupTileSizes[n] = 1;
-  }
-  for (int64_t k2 : llvm::drop_end(opInfo.getK2Dims())) {
-    reductionTileSizes[k2] = 1;
-  }
-
-  // Compute the M/N dimension tile size by multiply subgroup information.
   for (auto [i, mDim] : llvm::enumerate(mDims)) {
-    workgroupTileSizes[mDim] =
-        pvSchedule.mSubgroupCounts[i] * pvSchedule.mTileSizes[i];
-    // Multiply by the intrinsic shape for the inner most dim.
-    if (i == mDims.size() - 1) {
-      workgroupTileSizes[mDim] *= llvm::product_of(pvSchedule.mSizes);
-    }
     subgroupBasis.counts[mDim] = pvSchedule.mSubgroupCounts[i];
   }
   for (auto [i, nDim] : llvm::enumerate(nDims)) {
-    workgroupTileSizes[nDim] =
-        pvSchedule.nSubgroupCounts[i] * pvSchedule.nTileSizes[i];
-    // Multiply by the intrinsic shape for the inner most dim.
-    if (i == nDims.size() - 1) {
-      workgroupTileSizes[nDim] *= llvm::product_of(pvSchedule.nSizes);
-    }
     subgroupBasis.counts[nDim] = pvSchedule.nSubgroupCounts[i];
-  }
-  for (auto [i, k2Dim] : llvm::enumerate(k2Dims)) {
-    reductionTileSizes[k2Dim] = pvSchedule.kTileSizes[i];
-    // Multiply by the intrinsic shape for the inner most dim.
-    if (i == k2Dims.size() - 1) {
-      reductionTileSizes[k2Dim] *= llvm::product_of(pvSchedule.kSizes);
-    }
   }
 
   SmallVector<NamedAttribute, 2> attrs = {
-      NamedAttribute("workgroup", b.getI64ArrayAttr(workgroupTileSizes)),
-      NamedAttribute("reduction", b.getI64ArrayAttr(reductionTileSizes))};
-  IREE::GPU::appendPromotedOperandsList(context, attrs, {0, 1, 2});
+      NamedAttribute("workgroup",
+                     b.getI64ArrayAttr(tilePlan.workgroupTileSizes)),
+      NamedAttribute("reduction",
+                     b.getI64ArrayAttr(tilePlan.reductionTileSizes))};
+  SmallVector<int64_t> promotedOperands = {0, 1, 2};
+  SmallVector<VectorType> qkOperandTileTypes;
+  qkSchedule.mmaKind.getUndistributedTileTypes(qkOperandTileTypes);
+  std::optional<int64_t> k1DomainDim =
+      opInfo.getK1Dims().size() == 1
+          ? std::optional<int64_t>(opInfo.getK1Dims().front())
+          : std::nullopt;
+  std::optional<int64_t> qK1TileSize;
+  std::optional<int64_t> kK1TileSize;
+  if (k1DomainDim) {
+    // Promoted operand shapes should describe the full K tile staged for the
+    // QK matmul, not just the intrinsic fragment K size. Using only the
+    // fragment size causes the promoted copy tile sizes to disagree with the
+    // contraction operand layouts derived from the full QK schedule.
+    int64_t qkKTileSize =
+        qkSchedule.getTotalKTileSize() * qkSchedule.getTotalKSize();
+    qK1TileSize = qkKTileSize;
+    kK1TileSize = qkKTileSize;
+  }
+  auto getPromotedDomainTileSizes = [&](std::optional<int64_t> k1TileSize) {
+    SmallVector<int64_t> domainTileSizes(tilePlan.promotedDomainTileSizes);
+    if (k1DomainDim && k1TileSize) {
+      domainTileSizes[*k1DomainDim] =
+          std::max(domainTileSizes[*k1DomainDim], *k1TileSize);
+    }
+    return domainTileSizes;
+  };
+  SmallVector<SmallVector<int64_t>> promotedTileShapes = {
+      getAttentionPromotedTileShape(op.getQueryMap(),
+                                    getPromotedDomainTileSizes(qK1TileSize)),
+      getAttentionPromotedTileShape(op.getKeyMap(),
+                                    getPromotedDomainTileSizes(kK1TileSize)),
+      getAttentionPromotedTileShape(op.getValueMap(),
+                                    tilePlan.promotedDomainTileSizes)};
+  IREE::GPU::appendPromotedOperandsList(context, attrs, promotedOperands, {},
+                                        promotedTileShapes);
 
   // Check if transposing both intrinsics eliminates the layout conflict
   // between QK output and PV LHS input.

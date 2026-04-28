@@ -522,6 +522,8 @@ func.func @attention_multi_m_dynamic(%arg0 : tensor<20x8x?x16x64xf16>, %arg1 : t
 // CHECK-SAME:           #iree_gpu.lowering_config
 // CHECK-SAME{LITERAL}:                  subgroup_basis = [[1, 4, 1, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5]]
 // CHECK-SAME:           #iree_gpu.lowering_config
+// CHECK-SAME:                           promote_operands = [0, 1, 2]
+// CHECK-SAME:                           promoted_tile_shapes = [array<i64: 1, 4, 1, 16, 64>, array<i64: 1, 64, 64>, array<i64: 1, 64, 64>]
 // CHECK-SAME:                           reduction =  [0, 0, 0, 0, 0, 64, 0]
 // CHECK-SAME:                           workgroup =  [1, 4, 1, 16, 0, 0, 64]
 

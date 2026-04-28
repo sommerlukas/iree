@@ -110,6 +110,11 @@ SmallVector<int64_t> deriveLinalgOpThreadTileSizes(linalg::LinalgOp linalgOp,
     return {};
   }
   SmallVector<int64_t> loopRanges = linalgOp.getStaticLoopRanges();
+  if (auto explicitTileSizes = linalgOp->getAttrOfType<DenseI64ArrayAttr>(
+          kVectorTileSizesAttrName)) {
+    loopRanges.assign(explicitTileSizes.asArrayRef().begin(),
+                      explicitTileSizes.asArrayRef().end());
+  }
   int64_t vectorSize = kPreferredCopyNumBits /
                        getElementTypeOrSelf(linalgOp->getResultTypes()[0])
                            .getIntOrFloatBitWidth();
