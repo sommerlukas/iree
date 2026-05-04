@@ -1,5 +1,4 @@
 // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-promote-matmul-operands),canonicalize)" | FileCheck %s
-// RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-promote-matmul-operands{attach-tile-sizes=true}),canonicalize)" | FileCheck %s --check-prefixes=CHECK,ATTACH
 
 #lowering_config = #iree_gpu.lowering_config<{promote_operands = [0, 1]}>
 
@@ -219,7 +218,6 @@ func.func @promote_with_cache_swizzle(%a: tensor<2x34x34x128xf32>, %b: tensor<2x
 //  CHECK-SAME:   %[[B:[A-Za-z0-9]+]]: tensor<2x8x256xf32>
 //   CHECK-DAG:   %[[SWIZZLE_A:.+]] = iree_gpu.buffer_resource_cast %[[A]] cacheSwizzleStride(%c512)
 //   CHECK-DAG:   %[[SWIZZLE_B:.+]] = iree_gpu.buffer_resource_cast %[[B]] cacheSwizzleStride(%c1024)
-
 //       CHECK:   %[[PA:.+]] = iree_linalg_ext.im2col
 //  CHECK-SAME:     lowering_config = #iree_gpu.derived_thread_config
 //  CHECK-SAME:     ins(%[[SWIZZLE_A]]
@@ -528,39 +526,3 @@ func.func @im2col_producer_dma_downgraded_to_derived(
 //  CHECK-SAME:     lowering_config = #iree_gpu.use_global_load_dma
 //       CHECK:   linalg.batch_matmul {{.*}} ins(%[[PA]], %[[PB]]
 //       CHECK: return
-
-// -----
-
-#lowering_config = #iree_gpu.lowering_config<{
-  promote_operands = [0, 1, 2],
-  promoted_tile_shapes = [array<i64: 1, 16, 32>, array<i64: 1, 16, 32>, array<i64: 1, 16, 16>]
-}>
-#map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
-#map1 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>
-#map2 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>
-#map3 = affine_map<(d0, d1, d2, d3, d4) -> ()>
-#map4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>
-#map5 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
-func.func @online_attention_attach_tile_sizes(%q: tensor<20x16x24xf16>, %k: tensor<20x16x24xf16>, %v: tensor<20x16x16xf16>) -> tensor<20x16x16xf32> {
-  %cst = arith.constant 2.041241e-01 : f16
-  %out = tensor.empty() : tensor<20x16x16xf32>
-  %max = tensor.empty() : tensor<20x16xf32>
-  %sum = tensor.empty() : tensor<20x16xf32>
-  %cst0 = arith.constant 0.0 : f32
-  %cst1 = arith.constant -3.40282347E+38 : f32
-  %o0 = linalg.fill ins(%cst0 : f32) outs(%out : tensor<20x16x16xf32>) -> tensor<20x16x16xf32>
-  %o1 = linalg.fill ins(%cst1 : f32) outs(%max : tensor<20x16xf32>) -> tensor<20x16xf32>
-  %o2 = linalg.fill ins(%cst0 : f32) outs(%sum : tensor<20x16xf32>) -> tensor<20x16xf32>
-  %res:3 = iree_linalg_ext.online_attention {indexing_maps = [#map, #map1, #map2, #map3, #map4, #map5, #map5], lowering_config = #lowering_config} ins(%q, %k, %v, %cst : tensor<20x16x24xf16>, tensor<20x16x24xf16>, tensor<20x16x16xf16>, f16) outs(%o0, %o1, %o2 : tensor<20x16x16xf32>, tensor<20x16xf32>, tensor<20x16xf32>) {
-  ^bb0(%arg0: f32):
-    iree_linalg_ext.yield %arg0 : f32
-  } -> tensor<20x16x16xf32>, tensor<20x16xf32>, tensor<20x16xf32>
-  return %res#0 : tensor<20x16x16xf32>
-}
-
-// CHECK-LABEL: func.func @online_attention_attach_tile_sizes(
-// ATTACH: %[[Q_COPY:.+]] = linalg.copy {iree_codegen.vector_tile_sizes = array<i64: 1, 16, 32>, lowering_config = #iree_gpu.derived_thread_config}
-// ATTACH: %[[K_COPY:.+]] = linalg.copy {iree_codegen.vector_tile_sizes = array<i64: 1, 16, 32>, lowering_config = #iree_gpu.derived_thread_config}
-// ATTACH: %[[V_COPY:.+]] = linalg.copy {iree_codegen.vector_tile_sizes = array<i64: 1, 16, 16>, lowering_config = #iree_gpu.derived_thread_config}
-// ATTACH: iree_linalg_ext.online_attention
-// ATTACH-SAME: ins(%[[Q_COPY]], %[[K_COPY]], %[[V_COPY]]

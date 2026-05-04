@@ -43,26 +43,20 @@ getPromotedOperandList(LoweringConfigAttr config);
 /// Helper to retrieve a list of operand promotion types.
 std::optional<ArrayRef<Attribute>>
 getPromotionTypesList(LoweringConfigAttr config);
-/// Helper to retrieve per-promoted-operand tile shapes.
-std::optional<SmallVector<SmallVector<int64_t>>>
-getPromotedTileShapesList(LoweringConfigAttr config);
 /// Append to `attrs` an `ArrayAttr` for `promotedOperands`.
 /// The `promotionTypes` is an optional list of Attributes
 /// describing how to promote each individual operand.
-void appendPromotedOperandsList(
-    MLIRContext *context, SmallVectorImpl<NamedAttribute> &attrs,
-    ArrayRef<int64_t> operands, ArrayRef<Attribute> promotionTypes = {},
-    std::optional<ArrayRef<SmallVector<int64_t>>> promotedTileShapes =
-        std::nullopt);
+void appendPromotedOperandsList(MLIRContext *context,
+                                SmallVectorImpl<NamedAttribute> &attrs,
+                                ArrayRef<int64_t> operands,
+                                ArrayRef<Attribute> promotionTypes = {});
 /// Create a new `LoweringConfigAttr` from `currAttr` with the promoted operands
 /// list modified/set to `operands`. Optional `promotionTypes` specifies how to
 /// promote each operand.
 IREE::GPU::LoweringConfigAttr setPromotedOperandsList(
     MLIRContext *context, IREE::GPU::LoweringConfigAttr currAttr,
     ArrayRef<int64_t> operands,
-    std::optional<ArrayRef<Attribute>> promotionTypes = std::nullopt,
-    std::optional<ArrayRef<SmallVector<int64_t>>> promotedTileShapes =
-        std::nullopt);
+    std::optional<ArrayRef<Attribute>> promotionTypes = std::nullopt);
 
 /// Helper to retrieve list of operand to pad.
 std::optional<SmallVector<int64_t>> getPaddingList(LoweringConfigAttr config,

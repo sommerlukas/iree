@@ -281,13 +281,6 @@ def GPUPromoteMatmulOperandsPass :
     "::mlir::iree_compiler::IREE::Codegen::IREECodegenDialect",
     "::mlir::iree_compiler::IREE::GPU::IREEGPUDialect"
   ];
-  let options = [
-    Option<"attachTileSizes",
-           "attach-tile-sizes", "bool",
-           /*default=*/"false",
-           "Attach iree_codegen.vector_tile_sizes to linalg.copy ops created "
-           "during promotion.">
-  ];
 }
 
 def GPUAllocPrivateMemoryForDPSOpsPass :

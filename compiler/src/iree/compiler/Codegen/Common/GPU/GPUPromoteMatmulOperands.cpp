@@ -118,48 +118,8 @@ void promoteResult(OpBuilder &builder, Operation *op, Value valToMakeShared) {
   });
 }
 
-static std::optional<SmallVector<int64_t>>
-getPromotedTileShapeForOperand(IREE::GPU::LoweringConfigAttr loweringConfig,
-                               unsigned operandNumber) {
-  auto promotedOperands = IREE::GPU::getPromotedOperandList(loweringConfig);
-  auto promotedTileShapes =
-      IREE::GPU::getPromotedTileShapesList(loweringConfig);
-  if (!promotedOperands || !promotedTileShapes ||
-      promotedOperands->size() != promotedTileShapes->size()) {
-    return std::nullopt;
-  }
-  for (auto [idx, promotedOperand] :
-       llvm::enumerate(promotedOperands.value())) {
-    if (promotedOperand == operandNumber) {
-      return (*promotedTileShapes)[idx];
-    }
-  }
-  return std::nullopt;
-}
-
-static void maybeAttachTileSizesToPromotedCopy(
-    OpBuilder &builder, IREE::GPU::LoweringConfigAttr loweringConfig,
-    unsigned operandNumber, Value promotedValue, bool attachTileSizes) {
-  if (!attachTileSizes) {
-    return;
-  }
-  auto copyOp = promotedValue.getDefiningOp<linalg::CopyOp>();
-  if (!copyOp) {
-    return;
-  }
-  auto tileShape =
-      getPromotedTileShapeForOperand(loweringConfig, operandNumber);
-  if (!tileShape) {
-    return;
-  }
-  copyOp->setAttr(kVectorTileSizesAttrName,
-                  builder.getDenseI64ArrayAttr(tileShape.value()));
-}
-
 void promoteOperand(OpBuilder &builder, Operation *op, unsigned index,
-                    IREE::GPU::LoweringConfigAttr loweringConfig,
-                    IREE::GPU::PromotionAttr promotionAttr,
-                    bool attachTileSizes) {
+                    IREE::GPU::PromotionAttr promotionAttr) {
   auto dpsOp = dyn_cast<DestinationStyleOpInterface>(op);
   if (!dpsOp) {
     return;
@@ -171,15 +131,12 @@ void promoteOperand(OpBuilder &builder, Operation *op, unsigned index,
     assert(index < op->getNumResults() &&
            "trying to promote out of bound result index");
     // TODO(qedawkins): Move result promotion to attribute interface.
-    promoteResult(builder, op, op->getResult(index));
-    return;
+    return promoteResult(builder, op, op->getResult(index));
   }
   OpOperand &operand = op->getOpOperand(index);
 
   Value replacement = promotionAttr.promoteOperand(builder, operand);
   op->setOperand(index, replacement);
-  maybeAttachTileSizesToPromotedCopy(builder, loweringConfig, index,
-                                     replacement, attachTileSizes);
 }
 
 struct GPUPromoteMatmulOperandsPass final
@@ -227,8 +184,7 @@ struct GPUPromoteMatmulOperandsPass final
               "promotion types does not implement promotion attr interface");
           return WalkResult::interrupt();
         }
-        promoteOperand(builder, op, operand.value(), loweringConfig,
-                       promotionType, attachTileSizes);
+        promoteOperand(builder, op, operand.value(), promotionType);
       }
       return WalkResult::advance();
     });
