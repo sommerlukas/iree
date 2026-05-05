@@ -137,7 +137,7 @@ iree_generated_e2e_runner_test(
     "local"
 )
 
-# Prefill tests: m=k2 (self-attention) with causal mask.
+# Prefill tests: m=k2 (self-attention) with inclusive causal mask.
 iree_generated_e2e_runner_test(
   NAME
     e2e_attention_cpu_f16_f16_f16_prefill_small
@@ -150,7 +150,7 @@ iree_generated_e2e_runner_test(
     "--key_type=f16"
     "--value_type=f16"
     "--shapes=prefill_small"
-    "--mask_type=causal"
+    "--mask_type=causal_inclusive"
   TEST_RUNNER
     iree_tools_testing_e2e_iree-e2e-attention-test
   TARGET_BACKENDS
@@ -174,7 +174,7 @@ iree_generated_e2e_runner_test(
     "--key_type=f16"
     "--value_type=f16"
     "--shapes=prefill_medium"
-    "--mask_type=causal"
+    "--mask_type=causal_inclusive"
   TEST_RUNNER
     iree_tools_testing_e2e_iree-e2e-attention-test
   TARGET_BACKENDS
@@ -365,7 +365,7 @@ iree_generated_e2e_runner_test(
     "requires-gpu-cdna3"
 )
 
-# GPU Prefill tests: m=k2 (self-attention) with causal mask.
+# GPU Prefill tests: m=k2 (self-attention) with inclusive causal mask.
 iree_generated_e2e_runner_test(
   NAME
     e2e_attention_gpu_cdna3_f16_f16_f16_prefill_small
@@ -378,7 +378,7 @@ iree_generated_e2e_runner_test(
     "--key_type=f16"
     "--value_type=f16"
     "--shapes=prefill_small"
-    "--mask_type=causal"
+    "--mask_type=causal_inclusive"
   TEST_RUNNER
     iree_tools_testing_e2e_iree-e2e-attention-test
   TARGET_BACKENDS
@@ -407,7 +407,7 @@ iree_generated_e2e_runner_test(
     "--key_type=f16"
     "--value_type=f16"
     "--shapes=prefill_medium"
-    "--mask_type=causal"
+    "--mask_type=causal_inclusive"
   TEST_RUNNER
     iree_tools_testing_e2e_iree-e2e-attention-test
   TARGET_BACKENDS
@@ -424,4 +424,33 @@ iree_generated_e2e_runner_test(
     "requires-gpu-cdna3"
 )
 
+# GPU Prefill tests: m=k2 (self-attention) with exclusive causal mask.
+iree_generated_e2e_runner_test(
+  NAME
+    e2e_attention_gpu_cdna3_f16_f16_f16_prefill_small_exclusive
+  TEST_TYPE
+    attention
+  GENERATOR
+    "generate_e2e_attention_tests.py"
+  GENERATOR_ARGS
+    "--query_type=f16"
+    "--key_type=f16"
+    "--value_type=f16"
+    "--shapes=prefill_small"
+    "--mask_type=causal_exclusive"
+  TEST_RUNNER
+    iree_tools_testing_e2e_iree-e2e-attention-test
+  TARGET_BACKENDS
+    "rocm"
+  DRIVERS
+    "hip"
+  COMPILER_FLAGS
+    ${IREE_HIP_TEST_COMPILER_FLAGS}
+  LABELS
+    "noasan"
+    "nomsan"
+    "notsan"
+    "noubsan"
+    "requires-gpu-cdna3"
+)
 endif()

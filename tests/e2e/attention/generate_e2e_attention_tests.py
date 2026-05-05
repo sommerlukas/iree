@@ -62,7 +62,8 @@ class ShapesId(enum.Enum):
 class MaskType(enum.Enum):
     NONE = "none"  # No mask
     ALL_ONES = "all_ones"  # All positions can attend (for decode)
-    CAUSAL = "causal"  # Lower triangular mask (for prefill)
+    CAUSAL_INCLUSIVE = "causal_inclusive"  # Lower triangular mask (for prefill)
+    CAUSAL_EXCLUSIVE = "causal_exclusive"  # Lower triangular mask (for prefill)
 
 
 # batch: Batch dimension
@@ -369,12 +370,23 @@ call_id = 0
 
 # Generate causal mask as i8 tensor (0 or 1 values) for shape [batch, m, k2]
 # Causal pattern: mask[b, i, j] = 1 if j <= i, else 0
-def generate_causal_mask_values(batch: int, m: int, k2: int) -> list:
+def generate_causal_mask_values_inclusive(batch: int, m: int, k2: int) -> list:
     mask = []
     for b in range(batch):
         for i in range(m):
             for j in range(k2):
                 mask.append(1 if j <= i else 0)
+    return mask
+
+
+# Generate causal mask as i8 tensor (0 or 1 values) for shape [batch, m, k2]
+# Causal pattern: mask[b, i, j] = 1 if j < i, else 0
+def generate_causal_mask_values_exclusive(batch: int, m: int, k2: int) -> list:
+    mask = []
+    for b in range(batch):
+        for i in range(m):
+            for j in range(k2):
+                mask.append(1 if j < i else 0)
     return mask
 
 
@@ -401,8 +413,10 @@ def generate_call(
     description = f"Attention shape (BATCHxMxK1xK2xN): {shapes_scale.batch}x{shapes_scale.m}x{shapes_scale.k1}x{shapes_scale.k2}x{shapes_scale.k1}x{shapes_scale.n}"
     if mask_type == MaskType.ALL_ONES:
         description = description + " (all-ones masked)"
-    elif mask_type == MaskType.CAUSAL:
-        description = description + " (causal masked)"
+    elif mask_type == MaskType.CAUSAL_INCLUSIVE:
+        description = description + " (causal masked - inclusive)"
+    elif mask_type == MaskType.CAUSAL_EXCLUSIVE:
+        description = description + " (causal masked - exclusive)"
     op = (
         f"func.func @{func_name}() attributes {{\n"
         f'  iree.reflection = {{description = "{description}"}}\n'
@@ -425,8 +439,10 @@ def generate_call(
         # Generate mask as i8, then convert to i1 for attention op.
         if mask_type == MaskType.ALL_ONES:
             mask_values = generate_all_ones_mask_values(batch, m, k2)
-        elif mask_type == MaskType.CAUSAL:
-            mask_values = generate_causal_mask_values(batch, m, k2)
+        elif mask_type == MaskType.CAUSAL_INCLUSIVE:
+            mask_values = generate_causal_mask_values_inclusive(batch, m, k2)
+        elif mask_type == MaskType.CAUSAL_EXCLUSIVE:
+            mask_values = generate_causal_mask_values_exclusive(batch, m, k2)
         mask_values_str = ", ".join(str(v) for v in mask_values)
         op = op + (
             f"  %mask_i8 = arith.constant dense<[{mask_values_str}]> : tensor<{mask_size}xi8>\n"
