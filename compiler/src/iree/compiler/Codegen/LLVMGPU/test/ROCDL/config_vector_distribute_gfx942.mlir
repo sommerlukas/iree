@@ -287,6 +287,51 @@ func.func @attention_20x4096x64x4096x64() {
 
 // -----
 
+// CHECK-LABEL: func.func @attention_20x16x24x16x16()
+
+#map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>
+#map2 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>
+#map3 = affine_map<(d0, d1, d2, d3, d4) -> ()>
+#map4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>
+#map5 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+func.func @attention_20x16x24x16x16() {
+  %cst = arith.constant 2.041241e-01 : f16
+  %c0 = arith.constant 0 : index
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x16x24xf16>>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x16x24xf16>>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x16x16xf16>>
+  %3 = hal.interface.binding.subspan layout(#pipeline_layout) binding(3) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<20x16x16xf32>>
+  %4 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0, 0], sizes = [20, 16, 24], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x16x24xf16>> -> tensor<20x16x24xf16>
+  %5 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0, 0], sizes = [20, 16, 24], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x16x24xf16>> -> tensor<20x16x24xf16>
+  %6 = iree_tensor_ext.dispatch.tensor.load %2, offsets = [0, 0, 0], sizes = [20, 16, 16], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x16x16xf16>> -> tensor<20x16x16xf16>
+  %8 = tensor.empty() : tensor<20x16x16xf32>
+  %9 = tensor.empty() : tensor<20x16xf32>
+  %cst_0 = arith.constant 0.000000e+00 : f32
+  %cst_1 = arith.constant -3.40282347E+38 : f32
+  %cst_2 = arith.constant 0.000000e+00 : f32
+  %10 = linalg.fill ins(%cst_0 : f32) outs(%8 : tensor<20x16x16xf32>) -> tensor<20x16x16xf32>
+  %11 = linalg.fill ins(%cst_1 : f32) outs(%9 : tensor<20x16xf32>) -> tensor<20x16xf32>
+  %12 = linalg.fill ins(%cst_2 : f32) outs(%9 : tensor<20x16xf32>) -> tensor<20x16xf32>
+  %13:3 = iree_linalg_ext.online_attention {indexing_maps = [#map, #map1, #map2, #map3, #map4, #map5, #map5]} ins(%4, %5, %6, %cst : tensor<20x16x24xf16>, tensor<20x16x24xf16>, tensor<20x16x16xf16>, f16) outs(%10, %11, %12 : tensor<20x16x16xf32>, tensor<20x16xf32>, tensor<20x16xf32>) {
+  ^bb0(%arg0: f32):
+    iree_linalg_ext.yield %arg0 : f32
+  } -> tensor<20x16x16xf32>, tensor<20x16xf32>, tensor<20x16xf32>
+  iree_tensor_ext.dispatch.tensor.store %13#0, %3, offsets = [0, 0, 0], sizes = [20, 16, 16], strides = [1, 1, 1] : tensor<20x16x16xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<20x16x16xf32>>
+  return
+}
+
+// CHECK: iree_linalg_ext.online_attention
+// CHECK-SAME: lowering_config = #iree_gpu.lowering_config<{promote_operands = [0, 1, 2], promoted_tile_shapes = [array<i64: 1, 16, 32>, array<i64: 1, 16, 32>, array<i64: 1, 16, 16>], reduction = [0, 0, 0, 16, 0], workgroup = [1, 16, 0, 0, 16]}>
+
+// -----
+
 // CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute>
 // CHECK-NOT:   prefetch_num_stages = 2
 

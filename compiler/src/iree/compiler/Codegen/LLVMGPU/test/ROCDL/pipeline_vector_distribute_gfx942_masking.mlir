@@ -71,6 +71,75 @@ hal.executable private @attention_k1_unaligned {
 // -----
 
 // Test that the vector distribute pipeline correctly handles attention with
+// a K1 dimension (24) that is padded up to the VMFMA reduction width (32) and
+// still lowered through the intrinsic route.
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+#translation = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute> workgroup_size = [64, 1, 1] subgroup_size = 64, {iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}>
+
+// CHECK-LABEL: func.func @attention_dispatch_0_attention_16x24x16x16()
+// CHECK: %alloc_7 = memref.alloc() : memref<16x36xf16, #gpu.address_space<workgroup>>
+// CHECK: %subview_8 = memref.subview %alloc_7[0, 0] [16, 32] [1, 1]
+// CHECK: arith.cmpi slt
+// CHECK-NOT: scf.for
+// CHECK: vector.transfer_read %alloc_9[%{{.+}}, %{{.+}}], %0 {in_bounds = [true, true]} : memref<16x36xf16, #gpu.address_space<workgroup>>, vector<1x8xf16>
+// CHECK: arith.select
+hal.executable private @attention_k1_padded_intrinsic {
+  hal.executable.variant public @rocm target(<"rocm", "rocm-hsaco-fb">) {
+    hal.executable.export public @attention_dispatch_0_attention_16x24x16x16 ordinal(0) layout(#hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) count(%arg0: !hal.device) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      hal.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @attention_dispatch_0_attention_16x24x16x16() attributes {translation_info = #translation} {
+        %cst = arith.constant 1.000000e+00 : f32
+        %cst_0 = arith.constant -3.40282347E+38 : f32
+        %cst_1 = arith.constant 0.000000e+00 : f32
+        %cst_2 = arith.constant 2.041020e-01 : f16
+        %c0 = arith.constant 0 : index
+        %0 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<16x24xf16, #hal.descriptor_type<storage_buffer>>
+        %1 = amdgpu.fat_raw_buffer_cast %0 resetOffset : memref<16x24xf16, #hal.descriptor_type<storage_buffer>> to memref<16x24xf16, #amdgpu.address_space<fat_raw_buffer>>
+        %2 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(1) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<16x24xf16, #hal.descriptor_type<storage_buffer>>
+        %3 = amdgpu.fat_raw_buffer_cast %2 resetOffset : memref<16x24xf16, #hal.descriptor_type<storage_buffer>> to memref<16x24xf16, #amdgpu.address_space<fat_raw_buffer>>
+        %4 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(2) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<16x16xf16, #hal.descriptor_type<storage_buffer>>
+        %5 = amdgpu.fat_raw_buffer_cast %4 resetOffset : memref<16x16xf16, #hal.descriptor_type<storage_buffer>> to memref<16x16xf16, #amdgpu.address_space<fat_raw_buffer>>
+        %6 = hal.interface.binding.subspan layout(<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">, #hal.pipeline.binding<storage_buffer, Indirect>], flags = Indirect>) binding(3) alignment(64) offset(%c0) flags(Indirect) : memref<16x16xf16, #hal.descriptor_type<storage_buffer>>
+        %7 = amdgpu.fat_raw_buffer_cast %6 resetOffset : memref<16x16xf16, #hal.descriptor_type<storage_buffer>> to memref<16x16xf16, #amdgpu.address_space<fat_raw_buffer>>
+        %8 = iree_codegen.load_from_buffer %1 : memref<16x24xf16, #amdgpu.address_space<fat_raw_buffer>> -> tensor<16x24xf16>
+        %9 = iree_codegen.load_from_buffer %3 : memref<16x24xf16, #amdgpu.address_space<fat_raw_buffer>> -> tensor<16x24xf16>
+        %10 = iree_codegen.load_from_buffer %5 : memref<16x16xf16, #amdgpu.address_space<fat_raw_buffer>> -> tensor<16x16xf16>
+        %11 = tensor.empty() : tensor<16x16xf16>
+        %12 = tensor.empty() : tensor<16x16xf32>
+        %13 = tensor.empty() : tensor<16xf32>
+        %14 = linalg.fill ins(%cst_1 : f32) outs(%12 : tensor<16x16xf32>) -> tensor<16x16xf32>
+        %15 = linalg.fill ins(%cst_0 : f32) outs(%13 : tensor<16xf32>) -> tensor<16xf32>
+        %16 = linalg.fill ins(%cst_1 : f32) outs(%13 : tensor<16xf32>) -> tensor<16xf32>
+        %17:3 = iree_linalg_ext.online_attention {decomposition_config = {pv_attrs = {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16, col_major = true>, promote_operands = [1], subgroup_basis = [[1, 1, 1, 1], [0, 2, 3]]}>}, qk_attrs = {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.virtual_mma_layout<VMFMA_F32_16x16x32_F16, col_major = true>, promote_operands = [0, 1], subgroup_basis = [[1, 1, 1, 1], [0, 1, 2]]}>}}, indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1)>, affine_map<(d0, d1, d2, d3) -> (d2, d1)>, affine_map<(d0, d1, d2, d3) -> (d2, d3)>, affine_map<(d0, d1, d2, d3) -> ()>, affine_map<(d0, d1, d2, d3) -> (d0, d3)>, affine_map<(d0, d1, d2, d3) -> (d0)>, affine_map<(d0, d1, d2, d3) -> (d0)>], lowering_config = #iree_gpu.lowering_config<{promote_operands = [0, 1, 2], promoted_tile_shapes = [array<i64: 16, 32>, array<i64: 16, 32>, array<i64: 16, 16>], reduction = [0, 0, 16, 0], workgroup = [16, 0, 0, 16]}>} ins(%8, %9, %10, %cst_2 : tensor<16x24xf16>, tensor<16x24xf16>, tensor<16x16xf16>, f16) outs(%14, %15, %16 : tensor<16x16xf32>, tensor<16xf32>, tensor<16xf32>) {
+        ^bb0(%arg0: f32):
+          iree_linalg_ext.yield %arg0 : f32
+        } -> tensor<16x16xf32>, tensor<16xf32>, tensor<16xf32>
+        %18 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%17#2, %17#0 : tensor<16xf32>, tensor<16x16xf32>) outs(%11 : tensor<16x16xf16>) {
+        ^bb0(%in: f32, %in_3: f32, %out: f16):
+          %19 = arith.divf %cst, %in : f32
+          %20 = arith.mulf %19, %in_3 : f32
+          %21 = arith.truncf %20 : f32 to f16
+          linalg.yield %21 : f16
+        } -> tensor<16x16xf16>
+        iree_codegen.store_to_buffer %18, %7 : tensor<16x16xf16> into memref<16x16xf16, #amdgpu.address_space<fat_raw_buffer>>
+        return
+      }
+    }
+  }
+}
+
+// -----
+
+// Test that the vector distribute pipeline correctly handles attention with
 // a K2 dimension (4080) that is not aligned to the tile size (64), requiring
 // masking.
 
