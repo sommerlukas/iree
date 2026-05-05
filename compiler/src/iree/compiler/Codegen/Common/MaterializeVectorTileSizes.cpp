@@ -471,6 +471,9 @@ public:
     // to_layout is always an anchor op; Propagate tile sizes backward to the
     // input.
     if (auto toLayout = dyn_cast<ToLayoutOp>(op)) {
+      if (toLayout.getSharedMemoryConversion()) {
+        return success();
+      }
       TileSizes tileSizes = getTileSizesFor(toLayout.getResult(), results[0]);
       TileSizeLattice *inputLattice = operands[0];
       propagateIfChanged(inputLattice, inputLattice->meet(tileSizes));
