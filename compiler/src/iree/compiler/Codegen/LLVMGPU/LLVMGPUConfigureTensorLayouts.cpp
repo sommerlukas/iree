@@ -6,6 +6,7 @@
 
 #include "compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/DerivedConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
@@ -296,9 +297,78 @@ SmallVector<int64_t> getIterationSpaceBounds(linalg::LinalgOp linalgOp) {
   return bounds;
 }
 
+static FailureOr<NestedLayoutAttr>
+getDerivedThreadLayout(MLIRContext *context, ArrayRef<int64_t> workgroupSize,
+                       ArrayRef<int64_t> logicalShape,
+                       ArrayRef<int64_t> elementTile) {
+  int64_t rank = logicalShape.size();
+  if (rank == 0 || elementTile.size() != rank) {
+    return failure();
+  }
+  SmallVector<int64_t> opShape(logicalShape.begin(), logicalShape.end());
+
+  for (auto [size, element] : llvm::zip_equal(opShape, elementTile)) {
+    if (ShapedType::isDynamic(size) || element <= 0) {
+      return failure();
+    }
+    if (size % element != 0) {
+      return failure();
+    }
+    size /= element;
+  }
+
+  SmallVector<int64_t> threadTile(rank, 1);
+  SmallVector<int64_t> threadStrides(rank, 0);
+  int64_t residualThreads = ShapedType::getNumElements(workgroupSize);
+  int64_t currStride = 1;
+
+  for (auto [tile, stride, size] :
+       llvm::reverse(llvm::zip(threadTile, threadStrides, opShape))) {
+    int64_t threadBlock;
+    if (residualThreads % size == 0) {
+      threadBlock = size;
+    } else if (size % residualThreads == 0) {
+      threadBlock = residualThreads;
+    } else {
+      return failure();
+    }
+
+    tile = threadBlock;
+    stride = currStride;
+    size /= threadBlock;
+
+    currStride *= threadBlock;
+    residualThreads /= threadBlock;
+  }
+
+  SmallVector<int64_t> subgroupTile(rank, 1);
+  SmallVector<int64_t> subgroupStrides(rank, 0);
+  SmallVector<int64_t> outerTile(rank, 1);
+  return IREE::VectorExt::NestedLayoutAttr::get(
+      context, subgroupTile, opShape, outerTile, threadTile, elementTile,
+      subgroupStrides, threadStrides);
+}
+
+static FailureOr<NestedLayoutAttr>
+getPromotedOperandDerivedThreadLayout(Type operandType,
+                                      ArrayRef<int64_t> workgroupSize,
+                                      VectorLayoutInterface intrinsicLayout) {
+  auto tensorType = dyn_cast<RankedTensorType>(operandType);
+  if (!tensorType) {
+    return failure();
+  }
+  SmallVector<int64_t> logicalShape = intrinsicLayout.getUndistributedShape();
+  SmallVector<int64_t> elementTile = IREE::GPU::deriveThreadTileSizes(
+      logicalShape, ShapedType::getNumElements(workgroupSize),
+      getElementTypeOrSelf(tensorType).getIntOrFloatBitWidth());
+  return getDerivedThreadLayout(operandType.getContext(), workgroupSize,
+                                logicalShape, elementTile);
+}
+
 static LogicalResult
 setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
-                     SmallVector<bool> promotedOperands, RewriterBase &rewriter,
+                     SmallVector<bool> promotedOperands,
+                     ArrayRef<int64_t> workgroupSize, RewriterBase &rewriter,
                      linalg::LinalgOp contract) {
   // This function should have only be called on a contraction op.
   assert(linalg::isaContractionOpInterface(contract) &&
@@ -318,8 +388,27 @@ setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
   Value rhs = contract->getOperand(1);
   Value acc = contract->getOperand(2);
 
-  // Set layouts for lhs, rhs and acc.
   rewriter.setInsertionPoint(contract);
+  auto setPromotedOperandLayout =
+      [&](Value &operand, VectorLayoutInterface layout) -> LogicalResult {
+    FailureOr<NestedLayoutAttr> derivedLayout =
+        getPromotedOperandDerivedThreadLayout(operand.getType(), workgroupSize,
+                                              layout);
+    if (failed(derivedLayout)) {
+      return contract->emitError(
+          "cannot build derived thread layout for promoted operand");
+    }
+    operand = ToLayoutOp::create(rewriter, loc, operand, *derivedLayout);
+    return success();
+  };
+
+  if ((promotedOperands[0] && failed(setPromotedOperandLayout(lhs, aLayout))) ||
+      (promotedOperands[1] && failed(setPromotedOperandLayout(rhs, bLayout))) ||
+      (promotedOperands[2] && failed(setPromotedOperandLayout(acc, cLayout)))) {
+    return failure();
+  }
+
+  // Set layouts for lhs, rhs and acc.
   auto layoutedLhs = ToLayoutOp::create(rewriter, loc, lhs, aLayout);
   auto layoutedRhs = ToLayoutOp::create(rewriter, loc, rhs, bLayout);
   auto layoutedAcc = ToLayoutOp::create(rewriter, loc, acc, cLayout);
@@ -356,9 +445,6 @@ setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
 static LogicalResult setDerivedThreadConfigLayout(
     IREE::GPU::DerivedThreadConfigAttr config, linalg::LinalgOp linalgOp,
     ArrayRef<int64_t> workgroupSize, RewriterBase &rewriter) {
-
-  int64_t opRank = linalgOp.getNumLoops();
-
   SmallVector<int64_t> elementTile = config.getStaticTilingLevelSizes(
       static_cast<unsigned>(IREE::GPU::TilingLevel::Thread), linalgOp);
 
@@ -371,65 +457,18 @@ static LogicalResult setDerivedThreadConfigLayout(
     opShape = sizes.value().vectorSizes;
   }
 
-  for (auto [index, size, element] : llvm::enumerate(opShape, elementTile)) {
-    if (ShapedType::isDynamic(size)) {
-      linalgOp->emitError() << "opShape could not be inferred";
-      return failure();
-    }
-
-    if (size % element != 0) {
-      linalgOp->emitError()
-          << "Operation with unsupported number of elements. "
-             "Chosen vector tile sizes for operation are not "
-             "divisible by operation loop ranges at dim: "
-          << index << ", size=" << size << ", vector size = " << element;
-      return failure();
-    }
-
-    size /= element;
+  FailureOr<NestedLayoutAttr> layout = getDerivedThreadLayout(
+      rewriter.getContext(), workgroupSize, opShape, elementTile);
+  if (failed(layout)) {
+    return linalgOp->emitError("cannot build derived thread layout");
   }
-
-  SmallVector<int64_t> threadTile(opRank, 1);
-  SmallVector<int64_t> threadStrides(opRank, 0);
-
-  int64_t residualThreads = ShapedType::getNumElements(workgroupSize);
-  int64_t currStride = 1;
-
-  for (auto [tile, stride, size] :
-       llvm::reverse(llvm::zip(threadTile, threadStrides, opShape))) {
-    int64_t threadBlock;
-    if (residualThreads % size == 0) {
-      threadBlock = size;
-    } else if (size % residualThreads == 0) {
-      threadBlock = residualThreads;
-    } else {
-      linalgOp->emitError() << "Operation with unsupported number of elements.";
-      return failure();
-    }
-
-    tile = threadBlock;
-    stride = currStride;
-    size /= threadBlock;
-
-    currStride *= threadBlock;
-    residualThreads /= threadBlock;
-  }
-
-  SmallVector<int64_t> subgroupTile(opRank, 1);
-  SmallVector<int64_t> subgroupStrides(opRank, 0);
-  SmallVector<int64_t> outerTile(opRank, 1);
-
-  MLIRContext *context = rewriter.getContext();
-  auto layout = IREE::VectorExt::NestedLayoutAttr::get(
-      context, subgroupTile, opShape, outerTile, threadTile, elementTile,
-      subgroupStrides, threadStrides);
 
   Location loc = linalgOp.getLoc();
 
   rewriter.setInsertionPointAfter(linalgOp);
   for (OpResult result : linalgOp->getResults()) {
     VectorLayoutInterface resultLayout =
-        layout.apply(linalgOp.getIndexingMapMatchingResult(result));
+        layout->apply(linalgOp.getIndexingMapMatchingResult(result));
     auto toLayout = ToLayoutOp::create(rewriter, loc, result, resultLayout);
     rewriter.replaceAllUsesExcept(result, toLayout, toLayout);
   }
@@ -445,8 +484,8 @@ static LogicalResult setIntrinsicLoweringConfigLayout(
   IREE::Codegen::InnerTileDescAttrInterface intrinsic = getIntrinsic(candidate);
 
   if (linalg::isaContractionOpInterface(candidate)) {
-    if (succeeded(setContractionAnchor(intrinsic, promotedOperands, rewriter,
-                                       candidate))) {
+    if (succeeded(setContractionAnchor(intrinsic, promotedOperands,
+                                       workgroupSize, rewriter, candidate))) {
       return success();
     }
   }
@@ -566,6 +605,9 @@ struct LLVMGPUConfigureTensorLayoutsPass final
           TypeSwitch<IREE::Codegen::LoweringConfigAttrInterface, LogicalResult>(
               getLoweringConfig(candidate))
               .Case([&](IREE::GPU::DerivedThreadConfigAttr config) {
+                if (isa<linalg::CopyOp>(candidate.getOperation())) {
+                  return success();
+                }
                 return setDerivedThreadConfigLayout(config, candidate,
                                                     workgroupSize, rewriter);
               })
