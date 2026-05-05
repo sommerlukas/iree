@@ -58,11 +58,16 @@ enum class PipelineMode {
 // - AsyncCopy mode: loadStage + computeStage
 // - StreamCopy mode: readStage + writeStage + computeStage
 struct StageClassification {
+  struct AsyncCopyStreamStage {
+    memref::AllocOp alloc;
+    SmallVector<Operation *> ops;
+  };
+
   PipelineMode mode;
   unsigned numStages;
 
   // AsyncCopy mode stages
-  SmallVector<Operation *> loadStage;
+  SmallVector<AsyncCopyStreamStage> asyncLoadStages;
 
   // StreamCopy mode stages
   SmallVector<Operation *> readStage;
@@ -75,7 +80,9 @@ struct StageClassification {
   SmallVector<Operation *> getAllOpsInOrder() const {
     SmallVector<Operation *> ops;
     if (mode == PipelineMode::AsyncCopy) {
-      llvm::append_range(ops, loadStage);
+      for (const AsyncCopyStreamStage &stream : asyncLoadStages) {
+        llvm::append_range(ops, stream.ops);
+      }
     } else {
       llvm::append_range(ops, readStage);
       llvm::append_range(ops, writeStage);
@@ -84,6 +91,11 @@ struct StageClassification {
     return ops;
   }
 };
+
+static bool isTwoStreamAsyncCopyMVP(const StageClassification &stages) {
+  return stages.mode == PipelineMode::AsyncCopy && stages.numStages == 3 &&
+         stages.asyncLoadStages.size() == 2;
+}
 } // namespace
 
 /// Checks if a loop contains gather_to_lds operations directly in the loop
@@ -390,18 +402,36 @@ static LogicalResult checkLoopIterations(scf::ForOp forOp) {
 // slice computation works naturally without special handling.
 // Returns failure if any scf.if has conflicting operations (both global reads
 // and shared writes).
-static LogicalResult identifyRootOperations(
-    scf::ForOp forOp, PipelineMode mode, SmallVector<Operation *> &loadRoots,
-    SmallVector<Operation *> &readRoots, SmallVector<Operation *> &writeRoots,
-    SmallVector<Operation *> &computeRoots) {
+static LogicalResult
+identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
+                       SmallVector<SmallVector<Operation *>> &asyncLoadRoots,
+                       SmallVector<memref::AllocOp> &asyncLoadAllocs,
+                       SmallVector<Operation *> &readRoots,
+                       SmallVector<Operation *> &writeRoots,
+                       SmallVector<Operation *> &computeRoots) {
 
   LDBG() << "\n=== Step 1: Identifying Root Operations ===";
 
   for (Operation &op : forOp.getBody()->getOperations()) {
     if (mode == PipelineMode::AsyncCopy) {
       // Async copy mode: gather_to_lds and scf.yield
-      if (isa<amdgpu::GatherToLDSOp>(op)) {
-        loadRoots.push_back(&op);
+      if (auto gatherOp = dyn_cast<amdgpu::GatherToLDSOp>(op)) {
+        memref::AllocOp alloc = traceToAllocation(gatherOp.getDst());
+        if (alloc && hasSharedMemoryAddressSpace(alloc.getType())) {
+          auto it = llvm::find(asyncLoadAllocs, alloc);
+          if (it == asyncLoadAllocs.end()) {
+            asyncLoadAllocs.push_back(alloc);
+            asyncLoadRoots.emplace_back();
+            it = std::prev(asyncLoadAllocs.end());
+          }
+          asyncLoadRoots[std::distance(asyncLoadAllocs.begin(), it)].push_back(
+              &op);
+        } else if (asyncLoadRoots.empty()) {
+          asyncLoadRoots.emplace_back();
+          asyncLoadRoots.front().push_back(&op);
+        } else {
+          asyncLoadRoots.front().push_back(&op);
+        }
         LDBG() << "  Load root: " << op;
       } else if (isa<scf::YieldOp>(op)) {
         computeRoots.push_back(&op);
@@ -438,13 +468,31 @@ static LogicalResult identifyRootOperations(
     }
   }
 
-  LDBG() << "Found " << loadRoots.size() << " load roots, " << readRoots.size()
+  if (mode == PipelineMode::AsyncCopy) {
+    if (!(numStages == 3 && asyncLoadRoots.size() == 2)) {
+      SmallVector<Operation *> mergedRoots;
+      for (SmallVector<Operation *> &roots : asyncLoadRoots) {
+        llvm::append_range(mergedRoots, roots);
+      }
+      asyncLoadRoots.clear();
+      if (!mergedRoots.empty()) {
+        asyncLoadRoots.push_back(std::move(mergedRoots));
+      }
+      asyncLoadAllocs.clear();
+    }
+  }
+
+  size_t numAsyncLoadRoots = 0;
+  for (const SmallVector<Operation *> &roots : asyncLoadRoots) {
+    numAsyncLoadRoots += roots.size();
+  }
+  LDBG() << "Found " << numAsyncLoadRoots << " load roots, " << readRoots.size()
          << " read roots, " << writeRoots.size() << " write roots, "
          << computeRoots.size() << " compute roots";
 
   // Validate that we have the required roots - pipelining requires memory
   // operations to prefetch.
-  if (mode == PipelineMode::AsyncCopy && loadRoots.empty()) {
+  if (mode == PipelineMode::AsyncCopy && asyncLoadRoots.empty()) {
     LDBG() << "No gather_to_lds operations found";
     return failure();
   }
@@ -556,9 +604,12 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
     return failure();
   }
 
-  SmallVector<Operation *> loadRoots, readRoots, writeRoots, computeRoots;
-  if (failed(identifyRootOperations(forOp, mode, loadRoots, readRoots,
-                                    writeRoots, computeRoots))) {
+  SmallVector<SmallVector<Operation *>> asyncLoadRoots;
+  SmallVector<memref::AllocOp> asyncLoadAllocs;
+  SmallVector<Operation *> readRoots, writeRoots, computeRoots;
+  if (failed(identifyRootOperations(forOp, mode, numStages, asyncLoadRoots,
+                                    asyncLoadAllocs, readRoots, writeRoots,
+                                    computeRoots))) {
     return failure();
   }
 
@@ -568,21 +619,36 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
 
   if (mode == PipelineMode::AsyncCopy) {
     LDBG() << "\n=== Computing Backward Slices (Async Copy Mode) ===";
-    SetVector<Operation *> loadSlice, computeSlice;
+    SmallVector<SetVector<Operation *>> asyncLoadSlices(asyncLoadRoots.size());
+    SetVector<Operation *> computeSlice;
 
-    if (failed(computeBackwardSlice(loadRoots, forOp, loadSlice))) {
-      return failure();
+    stages.asyncLoadStages.reserve(asyncLoadRoots.size());
+    for (auto [index, roots] : llvm::enumerate(asyncLoadRoots)) {
+      if (failed(computeBackwardSlice(roots, forOp, asyncLoadSlices[index]))) {
+        return failure();
+      }
+      LDBG() << "  Load slice " << index << ": "
+             << asyncLoadSlices[index].size() << " operations";
+      StageClassification::AsyncCopyStreamStage &stage =
+          stages.asyncLoadStages.emplace_back();
+      stage.alloc =
+          index < asyncLoadAllocs.size() ? asyncLoadAllocs[index] : nullptr;
     }
-    LDBG() << "  Load slice: " << loadSlice.size() << " operations";
 
     if (failed(computeBackwardSlice(computeRoots, forOp, computeSlice))) {
       return failure();
     }
     LDBG() << "  Compute slice: " << computeSlice.size() << " operations";
 
-    if (failed(classifyOperationsIntoStages(
-            forOp, {{&loadSlice, &stages.loadStage},
-                    {&computeSlice, &stages.computeStage}}))) {
+    SmallVector<std::pair<SetVector<Operation *> *, SmallVector<Operation *> *>>
+        sliceToStage;
+    sliceToStage.reserve(asyncLoadSlices.size() + 1);
+    for (auto [index, stage] : llvm::enumerate(stages.asyncLoadStages)) {
+      sliceToStage.push_back({&asyncLoadSlices[index], &stage.ops});
+    }
+    sliceToStage.push_back({&computeSlice, &stages.computeStage});
+
+    if (failed(classifyOperationsIntoStages(forOp, sliceToStage))) {
       return failure();
     }
   } else {
@@ -620,9 +686,12 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
 
   LDBG() << "\n=== Final Stage Classification ===";
   if (stages.mode == PipelineMode::AsyncCopy) {
-    LDBG() << "--- Load Stage (" << stages.loadStage.size() << " ops) ---";
-    for (Operation *op : stages.loadStage) {
-      LDBG() << *op;
+    for (auto [index, stream] : llvm::enumerate(stages.asyncLoadStages)) {
+      LDBG() << "--- Load Stage " << index << " (" << stream.ops.size()
+             << " ops) ---";
+      for (Operation *op : stream.ops) {
+        LDBG() << *op;
+      }
     }
   } else {
     LDBG() << "--- Read Stage (" << stages.readStage.size() << " ops) ---";
@@ -673,11 +742,21 @@ populateOpToStageMap(const StageClassification &stages, scf::ForOp forOp,
   };
 
   if (stages.mode == PipelineMode::AsyncCopy) {
+    if (isTwoStreamAsyncCopyMVP(stages)) {
+      for (Operation *op : stages.asyncLoadStages[0].ops) {
+        assignOp(op, /*stage=*/0);
+      }
+      for (Operation *op : stages.asyncLoadStages[1].ops) {
+        assignOp(op, /*stage=*/1);
+      }
+      for (Operation *op : stages.computeStage) {
+        assignOp(op, /*stage=*/2);
+      }
+      return;
+    }
+
     // Async copy mode: load in stage 0, compute in last stage.
-    // For N-stage pipelining, this creates N-1 empty intermediate stages,
-    // resulting in N-1 prologue iterations (like Triton's async copy approach).
-    // Example for 3-stage: load→stage 0, compute→stage 2, stage 1 is empty.
-    for (Operation *op : stages.loadStage) {
+    for (Operation *op : stages.asyncLoadStages.front().ops) {
       assignOp(op, /*stage=*/0);
     }
     for (Operation *op : stages.computeStage) {
@@ -720,18 +799,34 @@ populateOpToClusterMap(const StageClassification &stages, unsigned numStages,
   unsigned clusterID = 0;
 
   if (stages.mode == PipelineMode::AsyncCopy) {
-    // Async copy mode: always load first, then compute.
-    // The execution order within each iteration is the same regardless of
-    // numStages. Only the prologue depth changes (N-1 iterations for N stages).
-    for (Operation *op : stages.loadStage) {
-      opToCluster[op] = clusterID;
-    }
-    ++clusterID;
+    if (isTwoStreamAsyncCopyMVP(stages)) {
+      // Compute before both streams so each LDS allocation can stay
+      // double-buffered even with 3 pipelining stages.
+      for (Operation *op : stages.computeStage) {
+        opToCluster[op] = clusterID;
+      }
+      ++clusterID;
 
-    for (Operation *op : stages.computeStage) {
-      opToCluster[op] = clusterID;
+      for (Operation *op : stages.asyncLoadStages[1].ops) {
+        opToCluster[op] = clusterID;
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.asyncLoadStages[0].ops) {
+        opToCluster[op] = clusterID;
+      }
+      ++clusterID;
+    } else {
+      for (Operation *op : stages.asyncLoadStages.front().ops) {
+        opToCluster[op] = clusterID;
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.computeStage) {
+        opToCluster[op] = clusterID;
+      }
+      ++clusterID;
     }
-    ++clusterID;
   } else if (numStages == 2) {
     // 2-stage pipeline: read first, then compute, then write
     // This allows reading for next iteration while computing current
@@ -1014,8 +1109,8 @@ static void insertStreamCopyBarriers(RewriterBase &rewriter,
 // - Prologue writes to shared memory via gather_to_lds
 // - Loop body writes (gather_to_lds) then reads for compute
 // - Multi-buffering ensures writes and reads target different LDS slots
-static void insertAsyncCopyBarriers(RewriterBase &rewriter,
-                                    scf::ForOp newForOp) {
+static void insertAsyncCopyBarriers(RewriterBase &rewriter, scf::ForOp newForOp,
+                                    bool readBeforeWriteInLoopBody) {
   Block *parentBlock = newForOp->getBlock();
   Location loc = newForOp.getLoc();
   SharedBarrierState state;
@@ -1028,6 +1123,7 @@ static void insertAsyncCopyBarriers(RewriterBase &rewriter,
                                   newForOp->getIterator(), state);
   }
 
+  state.needBarrierBeforeRead = readBeforeWriteInLoopBody;
   // Back-edge WAR hazard: previous iteration's reads → this iteration's
   // writes. The barrier before writes also covers the prologue→first
   // iteration synchronization.
@@ -1069,6 +1165,71 @@ static Operation *findLastGatherToLDS(Block::iterator begin,
     }
   }
   return nullptr;
+}
+
+static void
+insertAsyncMarksAfterGatherRuns(RewriterBase &rewriter, Location loc,
+                                Block::iterator begin, Block::iterator end,
+                                ArrayRef<memref::AllocOp> streamAllocs) {
+  Operation *lastGatherInRun = nullptr;
+  memref::AllocOp currentAlloc = nullptr;
+  auto flushRun = [&]() {
+    if (!lastGatherInRun) {
+      return;
+    }
+    rewriter.setInsertionPointAfter(lastGatherInRun);
+    ROCDL::AsyncmarkOp::create(rewriter, loc);
+    lastGatherInRun = nullptr;
+    currentAlloc = nullptr;
+  };
+
+  for (auto it = begin; it != end; ++it) {
+    auto gatherOp = dyn_cast<amdgpu::GatherToLDSOp>(&*it);
+    memref::AllocOp alloc =
+        gatherOp ? traceToAllocation(gatherOp.getDst()) : nullptr;
+    bool trackedAlloc = alloc && llvm::is_contained(streamAllocs, alloc);
+
+    if (!trackedAlloc || alloc != currentAlloc) {
+      flushRun();
+    }
+    if (trackedAlloc) {
+      currentAlloc = alloc;
+      lastGatherInRun = &*it;
+    }
+  }
+
+  flushRun();
+}
+
+static void
+insertWaitsForPendingAsyncReadPhases(RewriterBase &rewriter, Location loc,
+                                     Block::iterator begin, Block::iterator end,
+                                     ArrayRef<memref::AllocOp> streamAllocs,
+                                     int16_t waitCount, bool pendingAsync) {
+  for (auto it = begin; it != end; ++it) {
+    auto gatherOp = dyn_cast<amdgpu::GatherToLDSOp>(&*it);
+    memref::AllocOp alloc =
+        gatherOp ? traceToAllocation(gatherOp.getDst()) : nullptr;
+    if (alloc && llvm::is_contained(streamAllocs, alloc)) {
+      pendingAsync = true;
+      continue;
+    }
+    if (!pendingAsync) {
+      continue;
+    }
+    if (!hasNestedSharedRead(&*it)) {
+      continue;
+    }
+    Operation *insertPt = &*it;
+    if (Operation *prev = insertPt->getPrevNode();
+        prev && isa<gpu::BarrierOp>(prev)) {
+      insertPt = prev;
+    }
+    rewriter.setInsertionPoint(insertPt);
+    ROCDL::WaitAsyncmarkOp::create(rewriter, loc,
+                                   rewriter.getI16IntegerAttr(waitCount));
+    pendingAsync = false;
+  }
 }
 
 /// Sets the async flag on gather_to_lds ops in the given block range so they
@@ -1175,15 +1336,43 @@ static void insertEpilogueAsyncWait(RewriterBase &rewriter, Location loc,
 /// new DMA group we wait until only (N-1) groups are in flight, ensuring the
 /// oldest group's data is ready for reading.
 static void insertExplicitAsyncMarkers(RewriterBase &rewriter,
-                                       scf::ForOp newForOp, unsigned numStages,
+                                       scf::ForOp newForOp,
+                                       const StageClassification &stages,
                                        Block::iterator prologueStart) {
   Block *parentBlock = newForOp->getBlock();
   Location loc = newForOp.getLoc();
-  int16_t waitCount = static_cast<int16_t>(numStages - 1);
 
   enableAsyncOnGatherOps(parentBlock, prologueStart);
+  if (isTwoStreamAsyncCopyMVP(stages)) {
+    SmallVector<memref::AllocOp> streamAllocs;
+    streamAllocs.reserve(stages.asyncLoadStages.size());
+    for (const StageClassification::AsyncCopyStreamStage &stream :
+         stages.asyncLoadStages) {
+      streamAllocs.push_back(stream.alloc);
+    }
+
+    insertAsyncMarksAfterGatherRuns(rewriter, loc, prologueStart,
+                                    newForOp->getIterator(), streamAllocs);
+    Block *body = newForOp.getBody();
+    insertAsyncMarksAfterGatherRuns(rewriter, loc, body->begin(),
+                                    std::prev(body->end()), streamAllocs);
+    insertWaitsForPendingAsyncReadPhases(rewriter, loc, body->begin(),
+                                         std::prev(body->end()), streamAllocs,
+                                         /*waitCount=*/1,
+                                         /*pendingAsync=*/true);
+    Block::iterator epilogueStart = std::next(newForOp->getIterator());
+    insertAsyncMarksAfterGatherRuns(rewriter, loc, epilogueStart,
+                                    parentBlock->end(), streamAllocs);
+    insertWaitsForPendingAsyncReadPhases(rewriter, loc, epilogueStart,
+                                         parentBlock->end(), streamAllocs,
+                                         /*waitCount=*/0,
+                                         /*pendingAsync=*/true);
+    return;
+  }
+
+  int16_t waitCount = static_cast<int16_t>(stages.numStages - 1);
   insertPrologueAsyncMarks(rewriter, loc, prologueStart,
-                           newForOp->getIterator(), numStages);
+                           newForOp->getIterator(), stages.numStages);
   insertLoopBodyAsyncMarkers(rewriter, loc, newForOp, waitCount);
   insertEpilogueAsyncWait(rewriter, loc, std::next(newForOp->getIterator()),
                           parentBlock->end());
@@ -1191,9 +1380,11 @@ static void insertExplicitAsyncMarkers(RewriterBase &rewriter,
 
 // Dispatches to the appropriate barrier insertion strategy based on mode.
 static void insertPipelineBarriers(RewriterBase &rewriter, scf::ForOp newForOp,
-                                   PipelineMode mode) {
-  if (mode == PipelineMode::AsyncCopy) {
-    insertAsyncCopyBarriers(rewriter, newForOp);
+                                   const StageClassification &stages) {
+  if (stages.mode == PipelineMode::AsyncCopy) {
+    insertAsyncCopyBarriers(rewriter, newForOp,
+                            /*readBeforeWriteInLoopBody=*/
+                            isTwoStreamAsyncCopyMVP(stages));
   } else {
     insertStreamCopyBarriers(rewriter, newForOp);
   }
@@ -1282,13 +1473,16 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
   // operations into pipeline stages. If it fails, we bail out before
   // multi-buffering touches the IR, preventing half-transformed state (e.g.,
   // doubled LDS allocations with no actual pipelining).
-  if (failed(computeStageClassification(forOp, mode, numStages))) {
+  auto initialStagesOr = computeStageClassification(forOp, mode, numStages);
+  if (failed(initialStagesOr)) {
     return forOp;
   }
+  const StageClassification &initialStages = *initialStagesOr;
 
   if (mode == PipelineMode::AsyncCopy) {
-    // Apply multi-buffering: numStages buffers for N-stage pipelining.
-    if (failed(multiBufferLDSAllocations(forOp, /*numBuffers=*/numStages))) {
+    unsigned numBuffers =
+        isTwoStreamAsyncCopyMVP(initialStages) ? 2 : numStages;
+    if (failed(multiBufferLDSAllocations(forOp, /*numBuffers=*/numBuffers))) {
       return failure();
     }
   }
@@ -1348,7 +1542,7 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
   scf::ForOp newForOp = *newForOpOr;
 
   // Insert barriers using the appropriate strategy for each mode.
-  insertPipelineBarriers(rewriter, newForOp, mode);
+  insertPipelineBarriers(rewriter, newForOp, stages);
 
   // For async copy mode, convert gather_to_lds to async and insert explicit
   // async markers (asyncmark + wait.asyncmark). This replaces the backend's
@@ -1360,7 +1554,7 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
     // ops that were before the original loop.
     Block::iterator prologueStart =
         noOpsBeforeLoop ? parentBlock->begin() : std::next(preLoopMarker);
-    insertExplicitAsyncMarkers(rewriter, newForOp, numStages, prologueStart);
+    insertExplicitAsyncMarkers(rewriter, newForOp, stages, prologueStart);
   }
 
   return newForOp;

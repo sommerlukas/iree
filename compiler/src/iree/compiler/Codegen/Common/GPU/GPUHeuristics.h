@@ -219,7 +219,7 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     int64_t subgroupSize, bool transposedQ = false, bool transposedK = true,
     bool transposedV = false, bool canUpcastAcc = false,
     bool mustBeAligned = true, bool useDirectLoad = false,
-    int64_t prefetchNumStages = 0);
+    int64_t prefetchNumStages = 0, int64_t attentionStreamBufferDepth = 0);
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
                               const GPUMMASchedule &schedule);

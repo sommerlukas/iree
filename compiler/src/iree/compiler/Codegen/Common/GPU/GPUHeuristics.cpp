@@ -74,7 +74,7 @@ static int64_t calculateOperandsSharedMemoryUsedInBytes(
     const GPUMMASchedule &schedule, int64_t lhsBitwidth, int64_t rhsBitwidth,
     int64_t lhsScaleBitwidth = 0, int64_t rhsScaleBitwidth = 0,
     int64_t numRhs = 1, bool useDirectLoad = false,
-    int64_t prefetchNumStages = 0) {
+    int64_t prefetchNumStages = 0, int64_t directLoadBufferDepth = -1) {
   int64_t tileM = schedule.getTotalMSize() * schedule.getTotalMTileSize() *
                   schedule.getTotalMSubgroupCount();
   int64_t tileN = schedule.getTotalNSize() * schedule.getTotalNTileSize() *
@@ -99,7 +99,8 @@ static int64_t calculateOperandsSharedMemoryUsedInBytes(
   // In direct load mode, ROCDLPrefetchSharedMemoryPass multi-buffers shared
   // memory allocations, where the number of buffers equals prefetchNumStages.
   if (useDirectLoad && prefetchNumStages > 0) {
-    totalBits *= prefetchNumStages;
+    totalBits *=
+        directLoadBufferDepth >= 0 ? directLoadBufferDepth : prefetchNumStages;
   }
 
   return totalBits / 8;
@@ -1135,7 +1136,7 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     const GPUMMAHeuristicSeeds &pvMatmulSeeds, int64_t sharedMemLimitInBytes,
     int64_t subgroupSize, bool transposedQ, bool transposedK, bool transposedV,
     bool canUpcastAcc, bool mustBeAligned, bool useDirectLoad,
-    int64_t prefetchNumStages) {
+    int64_t prefetchNumStages, int64_t attentionStreamBufferDepth) {
   SmallVector<uint64_t> qkViableIntrinsicIndices;
   SmallVector<uint64_t> pvViableIntrinsicIndices;
   for (const auto &[index, intrinsic] : llvm::enumerate(intrinsics)) {
@@ -1247,21 +1248,32 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
 
       int64_t lhsABitwidth = intrinsicA.aType.getIntOrFloatBitWidth();
       int64_t rhsABitwidth = intrinsicA.bType.getIntOrFloatBitWidth();
-      int64_t rhsBBitwidth = intrinsicB.bType.getIntOrFloatBitWidth();
-      // We don't need to use shared memory for lhsB if we can reuse A intrinsic
-      // output.
       int64_t lhsBBitwidth =
           canReuseAOutput ? 0 : intrinsicB.aType.getIntOrFloatBitWidth();
+      int64_t rhsBBitwidth = intrinsicB.bType.getIntOrFloatBitWidth();
+      int64_t streamBufferDepth = attentionStreamBufferDepth > 0
+                                      ? attentionStreamBufferDepth
+                                      : prefetchNumStages;
 
       int64_t sharedMemoryUsed =
           calculateOperandsSharedMemoryUsedInBytes(
-              qkSchedule, lhsABitwidth, rhsABitwidth,
+              qkSchedule, lhsABitwidth, /*rhsBitwidth=*/0,
               /*lhsScaleBitwidth=*/0, /*rhsScaleBitwidth=*/0, /*numRhs=*/1,
-              useDirectLoad, prefetchNumStages) +
+              useDirectLoad, prefetchNumStages,
+              /*directLoadBufferDepth=*/1) +
           calculateOperandsSharedMemoryUsedInBytes(
-              schedule, lhsBBitwidth, rhsBBitwidth,
+              qkSchedule, /*lhsBitwidth=*/0, rhsABitwidth,
               /*lhsScaleBitwidth=*/0, /*rhsScaleBitwidth=*/0, /*numRhs=*/1,
-              useDirectLoad, prefetchNumStages);
+              useDirectLoad, prefetchNumStages, streamBufferDepth) +
+          calculateOperandsSharedMemoryUsedInBytes(
+              schedule, lhsBBitwidth, /*rhsBitwidth=*/0,
+              /*lhsScaleBitwidth=*/0, /*rhsScaleBitwidth=*/0, /*numRhs=*/1,
+              useDirectLoad, prefetchNumStages,
+              /*directLoadBufferDepth=*/1) +
+          calculateOperandsSharedMemoryUsedInBytes(
+              schedule, /*lhsBitwidth=*/0, rhsBBitwidth,
+              /*lhsScaleBitwidth=*/0, /*rhsScaleBitwidth=*/0, /*numRhs=*/1,
+              useDirectLoad, prefetchNumStages, streamBufferDepth);
 
       LDBG() << "Available Shared Memory: " << sharedMemLimitInBytes << " bytes"
              << "Predicted Shared Memory Used by Schedule: " << sharedMemoryUsed

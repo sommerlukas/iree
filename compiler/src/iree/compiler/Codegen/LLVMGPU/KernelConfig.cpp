@@ -905,20 +905,25 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
   int64_t prefetchStages = clPrefetchNumStages.getValue().value_or(0);
+  int64_t attentionStreamBufferDepth =
+      useDirectLoad && prefetchStages > 0 ? std::min<int64_t>(prefetchStages, 2)
+                                          : 0;
   // First try to find a schedule with an exactly matching intrinsic.
   std::optional<std::pair<GPUMMASchedule, GPUMMASchedule>> attSchedule =
       deduceAttentionSchedule(
           qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds, maxSharedMemoryBytes,
           targetSubgroupSize, transposedQ, transposedK, transposedV,
           /*canUpcastAcc=*/false, /*mustBeAligned=*/true, useDirectLoad,
-          /*prefetchNumStages=*/prefetchStages);
+          /*prefetchNumStages=*/prefetchStages,
+          /*attentionStreamBufferDepth=*/attentionStreamBufferDepth);
   if (!attSchedule) {
     // Then try again by allowing upcasting accumulator.
     attSchedule = deduceAttentionSchedule(
         qkMatmul, pvMatmul, intrinsics, pvMatmulSeeds, maxSharedMemoryBytes,
         targetSubgroupSize, transposedQ, transposedK, transposedV,
         /*canUpcastAcc=*/true, /*mustBeAligned=*/true, useDirectLoad,
-        /*prefetchNumStages=*/prefetchStages);
+        /*prefetchNumStages=*/prefetchStages,
+        /*attentionStreamBufferDepth=*/attentionStreamBufferDepth);
   }
 
   if (!attSchedule) {
