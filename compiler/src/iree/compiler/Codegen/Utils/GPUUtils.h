@@ -334,6 +334,17 @@ IREE::GPU::TargetAttr getGPUTargetAttr(Operation *op);
 /// Returns true only for CDNA4+ (gfx950+) architectures.
 bool targetSupportsGlobalLoadDMA(IREE::GPU::TargetAttr target);
 
+/// Returns the subgroup size if the available elements are aligned to DMA
+/// transfer sizes for a single subgroup, std::nullopt otherwise.
+std::optional<int64_t> getDMAAlignedSubgroupSize(FunctionOpInterface funcOp,
+                                                 Type elementType,
+                                                 int64_t availableElements);
+
+/// Derives XOR swizzle parameters for DMA-promoted LDS allocations.
+FailureOr<XorShuffleParams>
+getXorShuffleParamsForDMA(IREE::GPU::TargetAttr target, int64_t elementBitWidth,
+                          int64_t totalElements, int64_t computeAccessWidth);
+
 // Methods to retrieve information association with `configuration` field
 // of `hal.executable.target` attribute used commonly in GPU codegen pipelines.
 std::optional<int64_t> getConfigWavesPerEu(DictionaryAttr targetAttr);
