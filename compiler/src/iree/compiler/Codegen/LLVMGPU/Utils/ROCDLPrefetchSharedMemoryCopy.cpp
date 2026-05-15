@@ -63,6 +63,9 @@ enum class AsyncCopyScheduleKind {
   /// Attention MVP schedule: stream A in stage 0, stream B in stage 1, and the
   /// whole chained-dot compute in stage 2.
   TwoStreamMVP,
+
+  /// Full chained-dot attention schedule across 4 stages.
+  ChainedDot4Stage,
 };
 
 struct LogicalDot {
@@ -74,6 +77,9 @@ struct ChainedDotInfo {
   LogicalDot dot2;
   memref::AllocOp dot1StreamAlloc;
   memref::AllocOp dot2StreamAlloc;
+  SetVector<Operation *> dot1AllOperandOps;
+  SetVector<Operation *> dot1OperandOps;
+  SetVector<Operation *> dot2OperandOps;
   SetVector<Operation *> interDotForwardSlice;
   SetVector<Operation *> earlyInterDotOps;
   SetVector<Operation *> lateInterDotOps;
@@ -124,6 +130,12 @@ static bool isTwoStreamAsyncCopyMVP(const StageClassification &stages) {
   return stages.mode == PipelineMode::AsyncCopy && stages.numStages == 3 &&
          stages.asyncCopySchedule == AsyncCopyScheduleKind::TwoStreamMVP &&
          stages.asyncLoadStages.size() == 2;
+}
+
+static bool isChainedDot4Stage(const StageClassification &stages) {
+  return stages.mode == PipelineMode::AsyncCopy && stages.numStages == 4 &&
+         stages.asyncCopySchedule == AsyncCopyScheduleKind::ChainedDot4Stage &&
+         stages.asyncLoadStages.size() == 2 && stages.chainedDotInfo;
 }
 } // namespace
 
@@ -587,6 +599,109 @@ static SmallVector<amdgpu::MFMAOp> collectMFMAsUsingAlloc(memref::AllocOp alloc,
       mfmas, [](Operation *op) { return cast<amdgpu::MFMAOp>(op); });
 }
 
+static bool valueDependsOnAlloc(Value root, memref::AllocOp alloc,
+                                scf::ForOp forOp) {
+  DenseSet<Value> visited;
+  SmallVector<Value> worklist;
+  worklist.push_back(root);
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second) {
+      continue;
+    }
+
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp || !forOp->isProperAncestor(defOp)) {
+      continue;
+    }
+
+    if (auto readOp = dyn_cast<vector::TransferReadOp>(defOp)) {
+      if (traceToAllocation(readOp.getBase()) == alloc) {
+        return true;
+      }
+      continue;
+    }
+
+    if (auto viewLikeOp = dyn_cast<ViewLikeOpInterface>(defOp)) {
+      worklist.push_back(viewLikeOp.getViewSource());
+      continue;
+    }
+
+    if (!isChainedDotAnalysisOp(defOp)) {
+      continue;
+    }
+
+    worklist.append(defOp->operand_begin(), defOp->operand_end());
+  }
+
+  return false;
+}
+
+static FailureOr<SetVector<Operation *>>
+collectDotOperandOps(const LogicalDot &dot, scf::ForOp forOp) {
+  SetVector<Operation *> operandOps;
+  BackwardSliceOptions options;
+  options.filter = [&](Operation *op) { return forOp->isProperAncestor(op); };
+
+  auto addOperandSlice = [&](Value operand) {
+    Operation *defOp = operand.getDefiningOp();
+    if (!defOp || !forOp->isProperAncestor(defOp)) {
+      return;
+    }
+    operandOps.insert(defOp);
+    SetVector<Operation *> backwardSlice;
+    (void)getBackwardSlice(defOp, &backwardSlice, options);
+    operandOps.insert_range(backwardSlice);
+  };
+
+  for (Operation *mfma : dot.mfmaOps) {
+    auto mfmaOp = cast<amdgpu::MFMAOp>(mfma);
+    addOperandSlice(mfmaOp.getSourceA());
+    addOperandSlice(mfmaOp.getSourceB());
+  }
+
+  if (operandOps.empty()) {
+    return failure();
+  }
+  return operandOps;
+}
+
+static FailureOr<SetVector<Operation *>>
+collectDotOperandOpsFromAlloc(memref::AllocOp alloc, const LogicalDot &dot,
+                              scf::ForOp forOp) {
+  SetVector<Operation *> operandOps;
+  BackwardSliceOptions options;
+  options.filter = [&](Operation *op) { return forOp->isProperAncestor(op); };
+
+  auto addOperandSlice = [&](Value operand) {
+    if (!valueDependsOnAlloc(operand, alloc, forOp)) {
+      return;
+    }
+
+    Operation *defOp = operand.getDefiningOp();
+    if (!defOp || !forOp->isProperAncestor(defOp)) {
+      return;
+    }
+
+    operandOps.insert(defOp);
+    SetVector<Operation *> backwardSlice;
+    (void)getBackwardSlice(defOp, &backwardSlice, options);
+    operandOps.insert_range(backwardSlice);
+  };
+
+  for (Operation *mfma : dot.mfmaOps) {
+    auto mfmaOp = cast<amdgpu::MFMAOp>(mfma);
+    addOperandSlice(mfmaOp.getSourceA());
+    addOperandSlice(mfmaOp.getSourceB());
+  }
+
+  if (operandOps.empty()) {
+    return failure();
+  }
+  return operandOps;
+}
+
 static unsigned countLoopLocalUses(Value value, scf::ForOp forOp) {
   unsigned count = 0;
   for (OpOperand &use : value.getUses()) {
@@ -714,6 +829,27 @@ analyzeChainedDotStructure(scf::ForOp forOp,
     return failAnalysis("could not assign distinct stream allocs to dot1/dot2");
   }
 
+  FailureOr<SetVector<Operation *>> dot1AllOperandOps =
+      collectDotOperandOps(info.dot1, forOp);
+  if (failed(dot1AllOperandOps)) {
+    return failAnalysis("could not collect dot1 operand ops");
+  }
+  info.dot1AllOperandOps = std::move(*dot1AllOperandOps);
+
+  FailureOr<SetVector<Operation *>> dot1OperandOps =
+      collectDotOperandOpsFromAlloc(info.dot1StreamAlloc, info.dot1, forOp);
+  if (failed(dot1OperandOps)) {
+    return failAnalysis("could not collect dot1 stream operand ops");
+  }
+  info.dot1OperandOps = std::move(*dot1OperandOps);
+
+  FailureOr<SetVector<Operation *>> dot2OperandOps =
+      collectDotOperandOpsFromAlloc(info.dot2StreamAlloc, info.dot2, forOp);
+  if (failed(dot2OperandOps)) {
+    return failAnalysis("could not collect dot2 operand ops");
+  }
+  info.dot2OperandOps = std::move(*dot2OperandOps);
+
   DenseSet<Operation *> lateOpsSet;
   unsigned numInterDotDot2Operands = 0;
   for (Operation *op : info.dot2.mfmaOps) {
@@ -757,6 +893,24 @@ analyzeChainedDotStructure(scf::ForOp forOp,
          << ", early ops=" << info.earlyInterDotOps.size()
          << ", late ops=" << info.lateInterDotOps.size();
   return info;
+}
+
+static void reorderAsyncLoadStreamsForChainedDot(
+    const ChainedDotInfo &info,
+    SmallVector<SmallVector<Operation *>> &asyncLoadRoots,
+    SmallVector<memref::AllocOp> &asyncLoadAllocs) {
+  if (asyncLoadRoots.size() != 2 || asyncLoadAllocs.size() != 2) {
+    return;
+  }
+  if (asyncLoadAllocs[0] == info.dot1StreamAlloc &&
+      asyncLoadAllocs[1] == info.dot2StreamAlloc) {
+    return;
+  }
+  if (asyncLoadAllocs[0] == info.dot2StreamAlloc &&
+      asyncLoadAllocs[1] == info.dot1StreamAlloc) {
+    std::swap(asyncLoadRoots[0], asyncLoadRoots[1]);
+    std::swap(asyncLoadAllocs[0], asyncLoadAllocs[1]);
+  }
 }
 
 // Step 1: Identify root operations for each stage.
@@ -836,10 +990,16 @@ identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
   if (mode == PipelineMode::AsyncCopy) {
     if (numStages >= 3 && asyncLoadRoots.size() == 2) {
       chainedDotInfo = analyzeChainedDotStructure(forOp, asyncLoadAllocs);
+      if (chainedDotInfo) {
+        reorderAsyncLoadStreamsForChainedDot(*chainedDotInfo, asyncLoadRoots,
+                                             asyncLoadAllocs);
+      }
     }
 
     if (numStages == 3 && chainedDotInfo) {
       asyncCopySchedule = AsyncCopyScheduleKind::TwoStreamMVP;
+    } else if (numStages == 4 && chainedDotInfo) {
+      asyncCopySchedule = AsyncCopyScheduleKind::ChainedDot4Stage;
     } else {
       // Chained-dot analysis is also used to prepare the later full schedule
       // work. Until that lands, non-MVP cases continue on the generic async
@@ -1144,6 +1304,29 @@ populateOpToStageMap(const StageClassification &stages, scf::ForOp forOp,
   };
 
   if (stages.mode == PipelineMode::AsyncCopy) {
+    if (isChainedDot4Stage(stages)) {
+      const ChainedDotInfo &info = *stages.chainedDotInfo;
+      for (Operation *op : stages.asyncLoadStages[0].ops) {
+        assignOp(op, /*stage=*/0);
+      }
+      for (Operation *op : stages.asyncLoadStages[1].ops) {
+        assignOp(op, /*stage=*/1);
+      }
+      for (Operation *op : stages.computeStage) {
+        if (info.dot1OperandOps.contains(op)) {
+          assignOp(op, /*stage=*/1);
+        } else if (info.dot1AllOperandOps.contains(op)) {
+          assignOp(op, /*stage=*/2);
+        } else if (info.dot1.mfmaOps.contains(op) ||
+                   info.earlyInterDotOps.contains(op)) {
+          assignOp(op, /*stage=*/2);
+        } else {
+          assignOp(op, /*stage=*/3);
+        }
+      }
+      return;
+    }
+
     if (isTwoStreamAsyncCopyMVP(stages)) {
       for (Operation *op : stages.asyncLoadStages[0].ops) {
         assignOp(op, /*stage=*/0);
@@ -1201,7 +1384,82 @@ populateOpToClusterMap(const StageClassification &stages, unsigned numStages,
   unsigned clusterID = 0;
 
   if (stages.mode == PipelineMode::AsyncCopy) {
-    if (isTwoStreamAsyncCopyMVP(stages)) {
+    if (isChainedDot4Stage(stages)) {
+      const ChainedDotInfo &info = *stages.chainedDotInfo;
+
+      for (Operation *op : stages.asyncLoadStages[1].ops) {
+        if (info.dot2OperandOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      for (Operation *op : stages.computeStage) {
+        if (info.dot2OperandOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.computeStage) {
+        if (info.lateInterDotOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.computeStage) {
+        if (info.dot2.mfmaOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      for (Operation *op : stages.computeStage) {
+        if (!opToCluster.count(op) && !info.dot1OperandOps.contains(op) &&
+            !info.dot1.mfmaOps.contains(op) &&
+            !info.earlyInterDotOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.computeStage) {
+        if (info.dot1.mfmaOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.computeStage) {
+        if (info.earlyInterDotOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.asyncLoadStages[0].ops) {
+        if (info.dot1OperandOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      for (Operation *op : stages.computeStage) {
+        if (info.dot1OperandOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.asyncLoadStages[1].ops) {
+        if (!info.dot2OperandOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+
+      for (Operation *op : stages.asyncLoadStages[0].ops) {
+        if (!info.dot1OperandOps.contains(op)) {
+          opToCluster[op] = clusterID;
+        }
+      }
+      ++clusterID;
+    } else if (isTwoStreamAsyncCopyMVP(stages)) {
       // Compute before both streams so each LDS allocation can stay
       // double-buffered even with 3 pipelining stages.
       for (Operation *op : stages.computeStage) {
@@ -1396,6 +1654,9 @@ struct SharedBarrierState {
   bool needBarrierBeforeRead = false;
 };
 
+static Operation *findFirstSharedRead(Block::iterator begin,
+                                      Block::iterator end);
+
 // Inserts synchronization barriers before shared memory accesses in the given
 // range using a running `SharedBarrierState`. Conceptually, we track whether
 // the next shared read (or write) must be preceded by a barrier, and only emit
@@ -1512,6 +1773,7 @@ static void insertStreamCopyBarriers(RewriterBase &rewriter,
 // - Loop body writes (gather_to_lds) then reads for compute
 // - Multi-buffering ensures writes and reads target different LDS slots
 static void insertAsyncCopyBarriers(RewriterBase &rewriter, scf::ForOp newForOp,
+                                    Block::iterator prologueStart,
                                     bool readBeforeWriteInLoopBody) {
   Block *parentBlock = newForOp->getBlock();
   Location loc = newForOp.getLoc();
@@ -1519,9 +1781,11 @@ static void insertAsyncCopyBarriers(RewriterBase &rewriter, scf::ForOp newForOp,
 
   bool isNested = isInsideLoop(newForOp);
 
-  if (isNested) {
-    state.needBarrierBeforeWrite = true;
-    state = insertBarriersInRange(rewriter, loc, parentBlock->begin(),
+  if (isNested || findFirstSharedRead(prologueStart, newForOp->getIterator())) {
+    if (isNested) {
+      state.needBarrierBeforeWrite = true;
+    }
+    state = insertBarriersInRange(rewriter, loc, prologueStart,
                                   newForOp->getIterator(), state);
   }
 
@@ -1758,7 +2022,7 @@ static void insertExplicitAsyncMarkers(RewriterBase &rewriter,
   Location loc = newForOp.getLoc();
 
   enableAsyncOnGatherOps(parentBlock, prologueStart);
-  if (isTwoStreamAsyncCopyMVP(stages)) {
+  if (isTwoStreamAsyncCopyMVP(stages) || isChainedDot4Stage(stages)) {
     SmallVector<memref::AllocOp> streamAllocs;
     streamAllocs.reserve(stages.asyncLoadStages.size());
     for (const StageClassification::AsyncCopyStreamStage &stream :
@@ -1766,14 +2030,20 @@ static void insertExplicitAsyncMarkers(RewriterBase &rewriter,
       streamAllocs.push_back(stream.alloc);
     }
 
+    int16_t waitCount = isChainedDot4Stage(stages) ? 0 : 1;
+
     insertAsyncMarksAfterGatherRuns(rewriter, loc, prologueStart,
                                     newForOp->getIterator(), streamAllocs);
+    insertWaitsForPendingAsyncReadPhases(rewriter, loc, prologueStart,
+                                         newForOp->getIterator(), streamAllocs,
+                                         /*waitCount=*/waitCount,
+                                         /*pendingAsync=*/false);
     Block *body = newForOp.getBody();
     insertAsyncMarksAfterGatherRuns(rewriter, loc, body->begin(),
                                     std::prev(body->end()), streamAllocs);
     insertWaitsForPendingAsyncReadPhases(rewriter, loc, body->begin(),
                                          std::prev(body->end()), streamAllocs,
-                                         /*waitCount=*/1,
+                                         /*waitCount=*/waitCount,
                                          /*pendingAsync=*/true);
     Block::iterator epilogueStart = std::next(newForOp->getIterator());
     insertAsyncMarksAfterGatherRuns(rewriter, loc, epilogueStart,
@@ -1795,11 +2065,13 @@ static void insertExplicitAsyncMarkers(RewriterBase &rewriter,
 
 // Dispatches to the appropriate barrier insertion strategy based on mode.
 static void insertPipelineBarriers(RewriterBase &rewriter, scf::ForOp newForOp,
-                                   const StageClassification &stages) {
+                                   const StageClassification &stages,
+                                   Block::iterator prologueStart) {
   if (stages.mode == PipelineMode::AsyncCopy) {
-    insertAsyncCopyBarriers(rewriter, newForOp,
+    insertAsyncCopyBarriers(rewriter, newForOp, prologueStart,
                             /*readBeforeWriteInLoopBody=*/
-                            isTwoStreamAsyncCopyMVP(stages));
+                            isTwoStreamAsyncCopyMVP(stages) ||
+                                isChainedDot4Stage(stages));
   } else {
     insertStreamCopyBarriers(rewriter, newForOp);
   }
@@ -1860,10 +2132,11 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
     if (numStages <= 1) {
       return forOp;
     }
-    // Async copy mode supports 2 or 3 stage pipelining with matching buffer
-    // count.
-    if (numStages > 3) {
-      LDBG() << "Async copy mode supports at most 3 stages, got " << numStages;
+    // Async copy mode supports at most 4 stages. The 4-stage configuration is
+    // reserved for the chained-dot attention schedule and is validated after
+    // the initial pure analysis pass.
+    if (numStages > 4) {
+      LDBG() << "Async copy mode supports at most 4 stages, got " << numStages;
       return failure();
     }
   } else {
@@ -1894,9 +2167,17 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
   }
   const StageClassification &initialStages = *initialStagesOr;
 
+  if (mode == PipelineMode::AsyncCopy && numStages == 4 &&
+      !isChainedDot4Stage(initialStages)) {
+    LDBG() << "Async copy mode supports 4 stages only for chained-dot loops";
+    return failure();
+  }
+
   if (mode == PipelineMode::AsyncCopy) {
-    unsigned numBuffers =
-        isTwoStreamAsyncCopyMVP(initialStages) ? 2 : numStages;
+    unsigned numBuffers = (isTwoStreamAsyncCopyMVP(initialStages) ||
+                           isChainedDot4Stage(initialStages))
+                              ? 2
+                              : numStages;
     if (failed(multiBufferLDSAllocations(forOp, /*numBuffers=*/numBuffers))) {
       return failure();
     }
@@ -1956,8 +2237,13 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
 
   scf::ForOp newForOp = *newForOpOr;
 
+  // Compute the start of the pipelining prologue, skipping any pre-existing
+  // ops that were before the original loop.
+  Block::iterator prologueStart =
+      noOpsBeforeLoop ? parentBlock->begin() : std::next(preLoopMarker);
+
   // Insert barriers using the appropriate strategy for each mode.
-  insertPipelineBarriers(rewriter, newForOp, stages);
+  insertPipelineBarriers(rewriter, newForOp, stages, prologueStart);
 
   // For async copy mode, convert gather_to_lds to async and insert explicit
   // async markers (asyncmark + wait.asyncmark). This replaces the backend's
@@ -1965,10 +2251,6 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
   // allowing DMA writes to a new buffer slot to overlap with ds_reads from the
   // previous slot.
   if (mode == PipelineMode::AsyncCopy) {
-    // Compute the start of the pipelining prologue, skipping any pre-existing
-    // ops that were before the original loop.
-    Block::iterator prologueStart =
-        noOpsBeforeLoop ? parentBlock->begin() : std::next(preLoopMarker);
     insertExplicitAsyncMarkers(rewriter, newForOp, stages, prologueStart);
   }
 
