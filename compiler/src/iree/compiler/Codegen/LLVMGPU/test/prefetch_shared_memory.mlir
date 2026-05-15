@@ -402,6 +402,9 @@ func.func @prefetch_nested_loop(%arg0: memref<128xf32>) {
 
 // CHECK-LABEL: @prefetch_gather_to_lds_two_operands
 // CHECK-3STAGE-LABEL: @prefetch_gather_to_lds_two_operands
+// TODO: Add attention-shaped coverage with multiple gathers per stream and
+// interleaved index ops, plus a direct-load matmul regression test that
+// documents whether 3-stage two-operand loops should use the MVP schedule.
 func.func @prefetch_gather_to_lds_two_operands(
     %A_global: memref<128x128xf32>,
     %B_global: memref<128x128xf32>,
@@ -412,23 +415,21 @@ func.func @prefetch_gather_to_lds_two_operands(
   %c1 = arith.constant 1 : index
   %c0 = arith.constant 0 : index
 
-  // 2-stage: double-buffered, 3-stage MVP: still double-buffered per stream
+  // 2-stage: double-buffered, 3-stage generic async-copy: triple-buffered.
   // CHECK: memref.alloc() : memref<2x1xf32, #gpu.address_space<workgroup>>
   // CHECK: memref.alloc() : memref<2x1xf32, #gpu.address_space<workgroup>>
-  // CHECK-3STAGE: memref.alloc() : memref<2x1xf32, #gpu.address_space<workgroup>>
-  // CHECK-3STAGE: memref.alloc() : memref<2x1xf32, #gpu.address_space<workgroup>>
+  // CHECK-3STAGE: memref.alloc() : memref<3x1xf32, #gpu.address_space<workgroup>>
+  // CHECK-3STAGE: memref.alloc() : memref<3x1xf32, #gpu.address_space<workgroup>>
   %A_lds = memref.alloc() : memref<1xf32, #gpu.address_space<workgroup>>
   %B_lds = memref.alloc() : memref<1xf32, #gpu.address_space<workgroup>>
 
   // 2-stage: 1 prologue iteration with async markers
   // CHECK-COUNT-2: amdgpu.gather_to_lds async
   // CHECK: rocdl.asyncmark
-  // 3-stage MVP prologue: K(0), V(0), K(1) are issued as separate async groups.
-  // CHECK-3STAGE: amdgpu.gather_to_lds async
+  // 3-stage generic prologue: 2 iterations, each with one async group.
+  // CHECK-3STAGE-COUNT-2: amdgpu.gather_to_lds async
   // CHECK-3STAGE: rocdl.asyncmark
-  // CHECK-3STAGE: amdgpu.gather_to_lds async
-  // CHECK-3STAGE: rocdl.asyncmark
-  // CHECK-3STAGE: amdgpu.gather_to_lds async
+  // CHECK-3STAGE-COUNT-2: amdgpu.gather_to_lds async
   // CHECK-3STAGE: rocdl.asyncmark
   // CHECK: scf.for
   // CHECK-3STAGE: scf.for
@@ -438,26 +439,11 @@ func.func @prefetch_gather_to_lds_two_operands(
     // CHECK: rocdl.asyncmark
     // CHECK: rocdl.wait.asyncmark 1
     // CHECK: gpu.barrier
-    // CHECK-3STAGE: rocdl.wait.asyncmark 1
-    // CHECK-3STAGE-NEXT: gpu.barrier
-    // CHECK-3STAGE-NEXT: %{{.*}} = vector.transfer_read
-    // CHECK-3STAGE-NEXT: %{{.*}} = vector.transfer_read
-    // CHECK-3STAGE-NEXT: %{{.*}} = arith.mulf
-    // CHECK-3STAGE-NEXT: %{{.*}} = arith.addf
-    // CHECK-3STAGE: arith.addi
     // CHECK-3STAGE: gpu.barrier
-    // CHECK-3STAGE: amdgpu.gather_to_lds async
+    // CHECK-3STAGE-COUNT-2: amdgpu.gather_to_lds async
     // CHECK-3STAGE: rocdl.asyncmark
-    // CHECK-3STAGE: amdgpu.gather_to_lds async
-    // CHECK-3STAGE: rocdl.asyncmark
-    // CHECK-3STAGE: scf.yield %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}
-    // CHECK-3STAGE: rocdl.wait.asyncmark 0
-    // CHECK-3STAGE: gpu.barrier memfence [#gpu.address_space<workgroup>]
-    // CHECK-3STAGE: gpu.barrier memfence [#gpu.address_space<workgroup>]
-    // CHECK-3STAGE-NEXT: amdgpu.gather_to_lds async
-    // CHECK-3STAGE-NEXT: rocdl.asyncmark
-    // CHECK-3STAGE-NEXT: rocdl.wait.asyncmark 0
-    // CHECK-3STAGE-NEXT: gpu.barrier memfence [#gpu.address_space<workgroup>]
+    // CHECK-3STAGE: rocdl.wait.asyncmark 2
+    // CHECK-3STAGE: gpu.barrier
     amdgpu.gather_to_lds %A_global[%c0, %k], %A_lds[%c0] : vector<1xf32>, memref<128x128xf32>, memref<1xf32, #gpu.address_space<workgroup>>
     amdgpu.gather_to_lds %B_global[%k, %c0], %B_lds[%c0] : vector<1xf32>, memref<128x128xf32>, memref<1xf32, #gpu.address_space<workgroup>>
 
@@ -480,6 +466,11 @@ func.func @prefetch_gather_to_lds_two_operands(
   // CHECK: gpu.barrier
   // CHECK: vector.transfer_read
   // CHECK: arith.mulf
+  // 3-stage generic epilogue: wait for pending groups, barrier, then compute.
+  // CHECK-3STAGE: rocdl.wait.asyncmark 0
+  // CHECK-3STAGE: gpu.barrier
+  // CHECK-3STAGE: vector.transfer_read
+  // CHECK-3STAGE: arith.mulf
 
   vector.transfer_write %result, %C_global[%c0] {in_bounds = [true]} : vector<1xf32>, memref<128xf32>
   return

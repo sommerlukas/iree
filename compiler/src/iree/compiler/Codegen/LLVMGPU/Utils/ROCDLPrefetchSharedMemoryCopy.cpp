@@ -8,6 +8,7 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -53,6 +54,16 @@ enum class PipelineMode {
   StreamCopy
 };
 
+enum class AsyncCopyScheduleKind {
+  /// Generic async-copy schedule: all gather_to_lds ops are stage 0 and compute
+  /// is stage N - 1.
+  Generic,
+
+  /// Attention MVP schedule: stream A in stage 0, stream B in stage 1, and the
+  /// whole chained-dot compute in stage 2.
+  TwoStreamMVP,
+};
+
 // Structure to hold the stage classification result.
 // Which fields are populated depends on the mode:
 // - AsyncCopy mode: loadStage + computeStage
@@ -65,6 +76,7 @@ struct StageClassification {
 
   PipelineMode mode;
   unsigned numStages;
+  AsyncCopyScheduleKind asyncCopySchedule = AsyncCopyScheduleKind::Generic;
 
   // AsyncCopy mode stages
   SmallVector<AsyncCopyStreamStage> asyncLoadStages;
@@ -94,6 +106,7 @@ struct StageClassification {
 
 static bool isTwoStreamAsyncCopyMVP(const StageClassification &stages) {
   return stages.mode == PipelineMode::AsyncCopy && stages.numStages == 3 &&
+         stages.asyncCopySchedule == AsyncCopyScheduleKind::TwoStreamMVP &&
          stages.asyncLoadStages.size() == 2;
 }
 } // namespace
@@ -396,6 +409,54 @@ static LogicalResult checkLoopIterations(scf::ForOp forOp) {
   return success();
 }
 
+static bool hasChainedDotMFMAOperandFlow(scf::ForOp forOp) {
+  SmallVector<amdgpu::MFMAOp> mfmaOps;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (auto mfmaOp = dyn_cast<amdgpu::MFMAOp>(op)) {
+      mfmaOps.push_back(mfmaOp);
+    }
+  }
+  if (mfmaOps.size() < 2) {
+    return false;
+  }
+
+  for (amdgpu::MFMAOp sourceMFMA : mfmaOps) {
+    DenseSet<Value> visited;
+    SmallVector<Value> worklist;
+    visited.insert(sourceMFMA.getDestD());
+    worklist.push_back(sourceMFMA.getDestD());
+
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      for (OpOperand &use : value.getUses()) {
+        Operation *user = use.getOwner();
+        if (!forOp->isProperAncestor(user) || isa<scf::YieldOp>(user)) {
+          continue;
+        }
+
+        if (auto targetMFMA = dyn_cast<amdgpu::MFMAOp>(user)) {
+          if (targetMFMA.getOperation() != sourceMFMA.getOperation() &&
+              (targetMFMA.getSourceA() == value ||
+               targetMFMA.getSourceB() == value)) {
+            return true;
+          }
+        }
+
+        if (!isPure(user)) {
+          continue;
+        }
+        for (Value result : user->getResults()) {
+          if (visited.insert(result).second) {
+            worklist.push_back(result);
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 // Step 1: Identify root operations for each stage.
 // Root operations are the anchors from which we compute backward slices.
 // This function looks inside scf.if blocks to find roots, so that backward
@@ -406,6 +467,7 @@ static LogicalResult
 identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
                        SmallVector<SmallVector<Operation *>> &asyncLoadRoots,
                        SmallVector<memref::AllocOp> &asyncLoadAllocs,
+                       AsyncCopyScheduleKind &asyncCopySchedule,
                        SmallVector<Operation *> &readRoots,
                        SmallVector<Operation *> &writeRoots,
                        SmallVector<Operation *> &computeRoots) {
@@ -469,7 +531,10 @@ identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
   }
 
   if (mode == PipelineMode::AsyncCopy) {
-    if (!(numStages == 3 && asyncLoadRoots.size() == 2)) {
+    if (numStages == 3 && asyncLoadRoots.size() == 2 &&
+        hasChainedDotMFMAOperandFlow(forOp)) {
+      asyncCopySchedule = AsyncCopyScheduleKind::TwoStreamMVP;
+    } else {
       SmallVector<Operation *> mergedRoots;
       for (SmallVector<Operation *> &roots : asyncLoadRoots) {
         llvm::append_range(mergedRoots, roots);
@@ -479,6 +544,7 @@ identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
         asyncLoadRoots.push_back(std::move(mergedRoots));
       }
       asyncLoadAllocs.clear();
+      asyncCopySchedule = AsyncCopyScheduleKind::Generic;
     }
   }
 
@@ -606,16 +672,18 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
 
   SmallVector<SmallVector<Operation *>> asyncLoadRoots;
   SmallVector<memref::AllocOp> asyncLoadAllocs;
+  AsyncCopyScheduleKind asyncCopySchedule = AsyncCopyScheduleKind::Generic;
   SmallVector<Operation *> readRoots, writeRoots, computeRoots;
   if (failed(identifyRootOperations(forOp, mode, numStages, asyncLoadRoots,
-                                    asyncLoadAllocs, readRoots, writeRoots,
-                                    computeRoots))) {
+                                    asyncLoadAllocs, asyncCopySchedule,
+                                    readRoots, writeRoots, computeRoots))) {
     return failure();
   }
 
   StageClassification stages;
   stages.mode = mode;
   stages.numStages = numStages;
+  stages.asyncCopySchedule = asyncCopySchedule;
 
   if (mode == PipelineMode::AsyncCopy) {
     LDBG() << "\n=== Computing Backward Slices (Async Copy Mode) ===";
@@ -1182,6 +1250,17 @@ insertAsyncMarksAfterGatherRuns(RewriterBase &rewriter, Location loc,
     lastGatherInRun = nullptr;
     currentAlloc = nullptr;
   };
+  auto isAddressOnlyOp = [](Operation *op) {
+    if (!isPure(op)) {
+      return false;
+    }
+    if (isa<ViewLikeOpInterface>(op)) {
+      return true;
+    }
+    return llvm::all_of(op->getResultTypes(), [](Type type) {
+      return type.isIndex() || type.isInteger();
+    });
+  };
 
   for (auto it = begin; it != end; ++it) {
     auto gatherOp = dyn_cast<amdgpu::GatherToLDSOp>(&*it);
@@ -1190,7 +1269,9 @@ insertAsyncMarksAfterGatherRuns(RewriterBase &rewriter, Location loc,
     bool trackedAlloc = alloc && llvm::is_contained(streamAllocs, alloc);
 
     if (!trackedAlloc || alloc != currentAlloc) {
-      flushRun();
+      if (!lastGatherInRun || trackedAlloc || !isAddressOnlyOp(&*it)) {
+        flushRun();
+      }
     }
     if (trackedAlloc) {
       currentAlloc = alloc;
