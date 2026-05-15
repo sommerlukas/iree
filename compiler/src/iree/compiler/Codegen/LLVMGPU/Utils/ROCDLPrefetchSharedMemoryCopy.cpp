@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <optional>
 #include "iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
@@ -64,6 +65,20 @@ enum class AsyncCopyScheduleKind {
   TwoStreamMVP,
 };
 
+struct LogicalDot {
+  SetVector<Operation *> mfmaOps;
+};
+
+struct ChainedDotInfo {
+  LogicalDot dot1;
+  LogicalDot dot2;
+  memref::AllocOp dot1StreamAlloc;
+  memref::AllocOp dot2StreamAlloc;
+  SetVector<Operation *> interDotForwardSlice;
+  SetVector<Operation *> earlyInterDotOps;
+  SetVector<Operation *> lateInterDotOps;
+};
+
 // Structure to hold the stage classification result.
 // Which fields are populated depends on the mode:
 // - AsyncCopy mode: loadStage + computeStage
@@ -77,6 +92,7 @@ struct StageClassification {
   PipelineMode mode;
   unsigned numStages;
   AsyncCopyScheduleKind asyncCopySchedule = AsyncCopyScheduleKind::Generic;
+  std::optional<ChainedDotInfo> chainedDotInfo;
 
   // AsyncCopy mode stages
   SmallVector<AsyncCopyStreamStage> asyncLoadStages;
@@ -409,40 +425,154 @@ static LogicalResult checkLoopIterations(scf::ForOp forOp) {
   return success();
 }
 
-static bool hasChainedDotMFMAOperandFlow(scf::ForOp forOp) {
+static SmallVector<amdgpu::MFMAOp> collectLoopMFMAs(scf::ForOp forOp) {
   SmallVector<amdgpu::MFMAOp> mfmaOps;
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (auto mfmaOp = dyn_cast<amdgpu::MFMAOp>(op)) {
       mfmaOps.push_back(mfmaOp);
     }
   }
-  if (mfmaOps.size() < 2) {
-    return false;
+  return mfmaOps;
+}
+
+static bool isChainedDotAnalysisOp(Operation *op) {
+  return isPure(op) || isa<gpu::SubgroupReduceOp>(op);
+}
+
+static void collectProducerMFMAs(Value root, scf::ForOp forOp,
+                                 SetVector<Operation *> &producerMFMAs) {
+  DenseSet<Value> visited;
+  SmallVector<Value> worklist;
+  if (!root) {
+    return;
+  }
+  visited.insert(root);
+  worklist.push_back(root);
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp || !forOp->isProperAncestor(defOp)) {
+      continue;
+    }
+    if (auto mfmaOp = dyn_cast<amdgpu::MFMAOp>(defOp)) {
+      producerMFMAs.insert(mfmaOp.getOperation());
+      continue;
+    }
+    if (!isChainedDotAnalysisOp(defOp)) {
+      continue;
+    }
+    for (Value operand : defOp->getOperands()) {
+      if (visited.insert(operand).second) {
+        worklist.push_back(operand);
+      }
+    }
+  }
+}
+
+static void expandMFMAAccumulatorChain(ArrayRef<amdgpu::MFMAOp> loopMFMAs,
+                                       SetVector<Operation *> &dotMFMAs) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (amdgpu::MFMAOp mfmaOp : loopMFMAs) {
+      Operation *mfma = mfmaOp.getOperation();
+      if (dotMFMAs.contains(mfma)) {
+        continue;
+      }
+
+      if (auto producer = mfmaOp.getDestC().getDefiningOp<amdgpu::MFMAOp>();
+          producer && dotMFMAs.contains(producer.getOperation())) {
+        dotMFMAs.insert(mfma);
+        changed = true;
+        continue;
+      }
+
+      for (OpOperand &use : mfmaOp.getDestD().getUses()) {
+        auto userMFMA = dyn_cast<amdgpu::MFMAOp>(use.getOwner());
+        if (!userMFMA || userMFMA.getDestC() != mfmaOp.getDestD()) {
+          continue;
+        }
+        if (dotMFMAs.contains(userMFMA.getOperation())) {
+          dotMFMAs.insert(mfma);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+}
+
+static void collectDotForwardPureSlice(const LogicalDot &dot, scf::ForOp forOp,
+                                       SetVector<Operation *> &forwardSlice,
+                                       DenseSet<Value> &derivedValues) {
+  SmallVector<Value> worklist;
+  for (Operation *mfma : dot.mfmaOps) {
+    Value result = cast<amdgpu::MFMAOp>(mfma).getDestD();
+    if (derivedValues.insert(result).second) {
+      worklist.push_back(result);
+    }
   }
 
-  for (amdgpu::MFMAOp sourceMFMA : mfmaOps) {
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (!forOp->isProperAncestor(user) || isa<scf::YieldOp>(user)) {
+        continue;
+      }
+      if (isa<amdgpu::MFMAOp>(user)) {
+        continue;
+      }
+      if (!isChainedDotAnalysisOp(user)) {
+        continue;
+      }
+      forwardSlice.insert(user);
+      for (Value result : user->getResults()) {
+        if (derivedValues.insert(result).second) {
+          worklist.push_back(result);
+        }
+      }
+    }
+  }
+}
+
+static bool isValueDerivedFromDot(Value value, const LogicalDot &dot,
+                                  const DenseSet<Value> &derivedValues) {
+  if (derivedValues.contains(value)) {
+    return true;
+  }
+  if (auto mfmaOp = value.getDefiningOp<amdgpu::MFMAOp>()) {
+    return dot.mfmaOps.contains(mfmaOp.getOperation());
+  }
+  return false;
+}
+
+static SmallVector<amdgpu::MFMAOp> collectMFMAsUsingAlloc(memref::AllocOp alloc,
+                                                          scf::ForOp forOp) {
+  SetVector<Operation *> mfmas;
+  forOp->walk([&](vector::TransferReadOp readOp) {
+    if (traceToAllocation(readOp.getBase()) != alloc) {
+      return;
+    }
     DenseSet<Value> visited;
     SmallVector<Value> worklist;
-    visited.insert(sourceMFMA.getDestD());
-    worklist.push_back(sourceMFMA.getDestD());
-
+    visited.insert(readOp.getResult());
+    worklist.push_back(readOp.getResult());
     while (!worklist.empty()) {
       Value value = worklist.pop_back_val();
       for (OpOperand &use : value.getUses()) {
         Operation *user = use.getOwner();
-        if (!forOp->isProperAncestor(user) || isa<scf::YieldOp>(user)) {
+        if (!forOp->isProperAncestor(user)) {
           continue;
         }
-
-        if (auto targetMFMA = dyn_cast<amdgpu::MFMAOp>(user)) {
-          if (targetMFMA.getOperation() != sourceMFMA.getOperation() &&
-              (targetMFMA.getSourceA() == value ||
-               targetMFMA.getSourceB() == value)) {
-            return true;
+        if (auto mfmaOp = dyn_cast<amdgpu::MFMAOp>(user)) {
+          if (mfmaOp.getSourceA() == value || mfmaOp.getSourceB() == value) {
+            mfmas.insert(mfmaOp.getOperation());
           }
+          continue;
         }
-
-        if (!isPure(user)) {
+        if (!isChainedDotAnalysisOp(user)) {
           continue;
         }
         for (Value result : user->getResults()) {
@@ -452,9 +582,181 @@ static bool hasChainedDotMFMAOperandFlow(scf::ForOp forOp) {
         }
       }
     }
+  });
+  return llvm::map_to_vector(
+      mfmas, [](Operation *op) { return cast<amdgpu::MFMAOp>(op); });
+}
+
+static unsigned countLoopLocalUses(Value value, scf::ForOp forOp) {
+  unsigned count = 0;
+  for (OpOperand &use : value.getUses()) {
+    if (forOp->isAncestor(use.getOwner())) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+static FailureOr<SetVector<Operation *>>
+collectLateInterDotPath(Value dot2Operand, scf::ForOp forOp,
+                        const LogicalDot &dot1,
+                        const DenseSet<Value> &dot1DerivedValues) {
+  SetVector<Operation *> latePath;
+  Value currentValue = dot2Operand;
+
+  while (Operation *defOp = currentValue.getDefiningOp()) {
+    if (!forOp->isProperAncestor(defOp)) {
+      return latePath;
+    }
+    if (auto mfmaOp = dyn_cast<amdgpu::MFMAOp>(defOp)) {
+      if (dot1.mfmaOps.contains(mfmaOp.getOperation())) {
+        return latePath;
+      }
+      return failure();
+    }
+    if (!isChainedDotAnalysisOp(defOp)) {
+      return failure();
+    }
+    if (countLoopLocalUses(currentValue, forOp) > 1) {
+      return latePath;
+    }
+
+    latePath.insert(defOp);
+    Value nextValue;
+    for (Value operand : defOp->getOperands()) {
+      if (isValueDerivedFromDot(operand, dot1, dot1DerivedValues)) {
+        nextValue = operand;
+        break;
+      }
+    }
+    if (!nextValue) {
+      return failure();
+    }
+    currentValue = nextValue;
   }
 
-  return false;
+  return latePath;
+}
+
+static FailureOr<ChainedDotInfo>
+analyzeChainedDotStructure(scf::ForOp forOp,
+                           ArrayRef<memref::AllocOp> asyncLoadAllocs) {
+  auto failAnalysis = [&](Twine reason) -> FailureOr<ChainedDotInfo> {
+    LDBG() << "Chained-dot analysis failed: " << reason;
+    return failure();
+  };
+
+  if (asyncLoadAllocs.size() != 2) {
+    return failAnalysis("expected exactly 2 async-load allocs");
+  }
+
+  SmallVector<amdgpu::MFMAOp> loopMFMAs = collectLoopMFMAs(forOp);
+  if (loopMFMAs.size() < 2) {
+    return failAnalysis("expected at least 2 loop-local MFMAs");
+  }
+
+  ChainedDotInfo info;
+  SetVector<Operation *> dot1Seeds;
+  SetVector<Operation *> dot2Seeds;
+  for (amdgpu::MFMAOp mfmaOp : loopMFMAs) {
+    SetVector<Operation *> producers;
+    collectProducerMFMAs(mfmaOp.getSourceA(), forOp, producers);
+    collectProducerMFMAs(mfmaOp.getSourceB(), forOp, producers);
+    if (producers.empty()) {
+      continue;
+    }
+    dot2Seeds.insert(mfmaOp.getOperation());
+    for (Operation *producer : producers) {
+      dot1Seeds.insert(producer);
+    }
+  }
+  if (dot1Seeds.empty() || dot2Seeds.empty()) {
+    return failAnalysis("could not split MFMA groups into dot1/dot2 seeds");
+  }
+
+  info.dot1.mfmaOps = dot1Seeds;
+  info.dot2.mfmaOps = dot2Seeds;
+  expandMFMAAccumulatorChain(loopMFMAs, info.dot1.mfmaOps);
+  expandMFMAAccumulatorChain(loopMFMAs, info.dot2.mfmaOps);
+
+  if (llvm::any_of(info.dot1.mfmaOps, [&](Operation *op) {
+        return info.dot2.mfmaOps.contains(op);
+      })) {
+    return failAnalysis("dot1/dot2 MFMA groups overlap");
+  }
+
+  DenseSet<Value> dot1DerivedValues;
+  collectDotForwardPureSlice(info.dot1, forOp, info.interDotForwardSlice,
+                             dot1DerivedValues);
+  if (info.interDotForwardSlice.empty()) {
+    return failAnalysis("dot1 has no pure forward slice into dot2");
+  }
+
+  for (memref::AllocOp alloc : asyncLoadAllocs) {
+    SmallVector<amdgpu::MFMAOp> users = collectMFMAsUsingAlloc(alloc, forOp);
+    bool feedsDot1 = llvm::any_of(users, [&](amdgpu::MFMAOp mfmaOp) {
+      return info.dot1.mfmaOps.contains(mfmaOp.getOperation());
+    });
+    bool feedsDot2 = llvm::any_of(users, [&](amdgpu::MFMAOp mfmaOp) {
+      return info.dot2.mfmaOps.contains(mfmaOp.getOperation());
+    });
+    if (feedsDot1 == feedsDot2) {
+      return failAnalysis("stream alloc does not feed exactly one logical dot");
+    }
+    if (feedsDot1) {
+      info.dot1StreamAlloc = alloc;
+    } else {
+      info.dot2StreamAlloc = alloc;
+    }
+  }
+  if (!info.dot1StreamAlloc || !info.dot2StreamAlloc ||
+      info.dot1StreamAlloc == info.dot2StreamAlloc) {
+    return failAnalysis("could not assign distinct stream allocs to dot1/dot2");
+  }
+
+  DenseSet<Operation *> lateOpsSet;
+  unsigned numInterDotDot2Operands = 0;
+  for (Operation *op : info.dot2.mfmaOps) {
+    auto dot2MFMA = cast<amdgpu::MFMAOp>(op);
+    for (Value operand :
+         {dot2MFMA.getSourceA(), dot2MFMA.getSourceB(), dot2MFMA.getDestC()}) {
+      if (!isValueDerivedFromDot(operand, info.dot1, dot1DerivedValues)) {
+        continue;
+      }
+      ++numInterDotDot2Operands;
+      FailureOr<SetVector<Operation *>> latePath =
+          collectLateInterDotPath(operand, forOp, info.dot1, dot1DerivedValues);
+      if (failed(latePath)) {
+        return failAnalysis("failed to classify late inter-dot path");
+      }
+      for (Operation *lateOp : *latePath) {
+        info.lateInterDotOps.insert(lateOp);
+        lateOpsSet.insert(lateOp);
+      }
+    }
+  }
+
+  for (Operation *op : info.interDotForwardSlice) {
+    if (!lateOpsSet.contains(op)) {
+      info.earlyInterDotOps.insert(op);
+    }
+  }
+
+  LDBG() << "Chained-dot candidate sizes: forward="
+         << info.interDotForwardSlice.size()
+         << ", dot2 operands=" << numInterDotDot2Operands
+         << ", early=" << info.earlyInterDotOps.size()
+         << ", late=" << info.lateInterDotOps.size();
+
+  if (info.earlyInterDotOps.empty() || info.lateInterDotOps.empty()) {
+    return failAnalysis("missing early or late inter-dot ops");
+  }
+  LDBG() << "Chained-dot analysis matched: dot1 mfmas="
+         << info.dot1.mfmaOps.size()
+         << ", dot2 mfmas=" << info.dot2.mfmaOps.size()
+         << ", early ops=" << info.earlyInterDotOps.size()
+         << ", late ops=" << info.lateInterDotOps.size();
+  return info;
 }
 
 // Step 1: Identify root operations for each stage.
@@ -468,6 +770,7 @@ identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
                        SmallVector<SmallVector<Operation *>> &asyncLoadRoots,
                        SmallVector<memref::AllocOp> &asyncLoadAllocs,
                        AsyncCopyScheduleKind &asyncCopySchedule,
+                       std::optional<ChainedDotInfo> &chainedDotInfo,
                        SmallVector<Operation *> &readRoots,
                        SmallVector<Operation *> &writeRoots,
                        SmallVector<Operation *> &computeRoots) {
@@ -531,10 +834,16 @@ identifyRootOperations(scf::ForOp forOp, PipelineMode mode, unsigned numStages,
   }
 
   if (mode == PipelineMode::AsyncCopy) {
-    if (numStages == 3 && asyncLoadRoots.size() == 2 &&
-        hasChainedDotMFMAOperandFlow(forOp)) {
+    if (numStages >= 3 && asyncLoadRoots.size() == 2) {
+      chainedDotInfo = analyzeChainedDotStructure(forOp, asyncLoadAllocs);
+    }
+
+    if (numStages == 3 && chainedDotInfo) {
       asyncCopySchedule = AsyncCopyScheduleKind::TwoStreamMVP;
     } else {
+      // Chained-dot analysis is also used to prepare the later full schedule
+      // work. Until that lands, non-MVP cases continue on the generic async
+      // path.
       SmallVector<Operation *> mergedRoots;
       for (SmallVector<Operation *> &roots : asyncLoadRoots) {
         llvm::append_range(mergedRoots, roots);
@@ -673,10 +982,12 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
   SmallVector<SmallVector<Operation *>> asyncLoadRoots;
   SmallVector<memref::AllocOp> asyncLoadAllocs;
   AsyncCopyScheduleKind asyncCopySchedule = AsyncCopyScheduleKind::Generic;
+  std::optional<ChainedDotInfo> chainedDotInfo;
   SmallVector<Operation *> readRoots, writeRoots, computeRoots;
   if (failed(identifyRootOperations(forOp, mode, numStages, asyncLoadRoots,
                                     asyncLoadAllocs, asyncCopySchedule,
-                                    readRoots, writeRoots, computeRoots))) {
+                                    chainedDotInfo, readRoots, writeRoots,
+                                    computeRoots))) {
     return failure();
   }
 
@@ -684,6 +995,7 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
   stages.mode = mode;
   stages.numStages = numStages;
   stages.asyncCopySchedule = asyncCopySchedule;
+  stages.chainedDotInfo = chainedDotInfo;
 
   if (mode == PipelineMode::AsyncCopy) {
     LDBG() << "\n=== Computing Backward Slices (Async Copy Mode) ===";
@@ -774,6 +1086,28 @@ computeStageClassification(scf::ForOp forOp, PipelineMode mode,
   LDBG() << "--- Compute Stage (" << stages.computeStage.size() << " ops) ---";
   for (Operation *op : stages.computeStage) {
     LDBG() << *op;
+  }
+  if (stages.chainedDotInfo) {
+    const ChainedDotInfo &info = *stages.chainedDotInfo;
+    LDBG() << "--- Chained Dot Analysis ---";
+    LDBG() << "dot1 stream alloc: " << *info.dot1StreamAlloc;
+    LDBG() << "dot2 stream alloc: " << *info.dot2StreamAlloc;
+    LDBG() << "dot1 mfmas: " << info.dot1.mfmaOps.size();
+    for (Operation *op : info.dot1.mfmaOps) {
+      LDBG() << *op;
+    }
+    LDBG() << "dot2 mfmas: " << info.dot2.mfmaOps.size();
+    for (Operation *op : info.dot2.mfmaOps) {
+      LDBG() << *op;
+    }
+    LDBG() << "early inter-dot ops: " << info.earlyInterDotOps.size();
+    for (Operation *op : info.earlyInterDotOps) {
+      LDBG() << *op;
+    }
+    LDBG() << "late inter-dot ops: " << info.lateInterDotOps.size();
+    for (Operation *op : info.lateInterDotOps) {
+      LDBG() << *op;
+    }
   }
 
   return stages;
